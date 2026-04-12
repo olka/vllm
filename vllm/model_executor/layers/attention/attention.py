@@ -9,7 +9,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.config.vllm import VllmConfig
-from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.forward_context import ForwardContext, get_forward_context, set_captured_query
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
@@ -502,6 +502,8 @@ class Attention(nn.Module, AttentionLayerBase):
         # CPU overheads from the non-CUDA-graph regions.
         query = query.view(-1, self.num_heads, self.head_size)
         output = output.view(-1, self.num_heads, self.head_size_v)
+        # Capture Q for block importance scoring (KV-GC).
+        set_captured_query(query)
         if key is not None:
             key = key.view(-1, self.num_kv_heads, self.head_size)
         if value is not None:

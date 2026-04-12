@@ -198,6 +198,51 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
+    def evict_blocks_at_positions(
+        self, request_id: str, positions: list[int]
+    ) -> tuple[list[KVCacheBlock], ...]:
+        """Evict blocks at specific positions across all KV cache groups.
+
+        Args:
+            request_id: The request ID.
+            positions: Sorted list of position indices to evict.
+
+        Returns:
+            Tuple of evicted block lists, one per KV cache group.
+        """
+        result = []
+        for manager in self.single_type_managers:
+            blocks = manager.req_to_blocks.get(request_id, [])
+            valid_positions = [p for p in positions if p < len(blocks)]
+            if valid_positions:
+                result.append(
+                    manager.evict_blocks_at_positions(
+                        request_id, valid_positions))
+            else:
+                result.append([])
+        return tuple(result)
+
+    def free_blocks_from_position(
+        self, request_id: str, start_position: int
+    ) -> int:
+        """Free all blocks from start_position onward across all groups.
+
+        Used for page fault recovery: roll back to the first evicted block.
+
+        Args:
+            request_id: The request ID.
+            start_position: The first block position to free.
+
+        Returns:
+            Total number of blocks freed across all groups.
+        """
+        total = 0
+        for manager in self.single_type_managers:
+            total += manager.free_blocks_from_position(
+                request_id, start_position
+            )
+        return total
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
         Get the number of common prefix blocks for all requests with allocated

@@ -1360,6 +1360,24 @@ class GPUModelRunner(
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
+        # Handle incremental GC evictions: zero out evicted block positions.
+        evicted = scheduler_output.evicted_block_positions
+        if evicted:
+            for req_id, eviction_list in evicted.items():
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is None:
+                    continue
+                for group_idx, block_pos in eviction_list:
+                    block_tables = self.input_batch.block_table
+                    if isinstance(block_tables, list):
+                        block_tables[group_idx].zero_block_positions(
+                            req_index, [block_pos]
+                        )
+                    else:
+                        block_tables.zero_block_positions(
+                            req_index, [block_pos]
+                        )
+
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
         # Allow attention backend to reorder the batch, potentially
@@ -3782,6 +3800,83 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    def _compute_block_importance_scores(
+        self,
+    ) -> dict[str, list[tuple[int, float]]] | None:
+        """Compute block importance scores using Q@K attention scoring.
+
+        Uses the captured query tensor from the last attention layer to
+        compute actual attention scores against the last layer's KV cache.
+        Falls back to ||V||/||K|| norm-ratio if Q is not available.
+
+        Returns:
+            Maps req_id -> list of (block_position, score) pairs,
+            or None if scoring is not possible.
+        """
+        if not self.kv_caches:
+            return None
+
+        # Use last layer's KV cache — matches the captured Q (also last layer).
+        # Last layer's attention pattern reflects final prediction decisions,
+        # while layer 0 sees everything uniformly.
+        kv_cache = self.kv_caches[-1]
+        if not isinstance(kv_cache, torch.Tensor) or kv_cache.dim() != 5:
+            return None
+
+        from vllm.forward_context import get_captured_query
+        from vllm.v1.core.block_importance import BlockImportanceScorer
+
+        _, num_blocks_total, block_size, num_kv_heads, head_size = (
+            kv_cache.shape
+        )
+
+        captured_query = get_captured_query()
+
+        result: dict[str, list[tuple[int, float]]] = {}
+        block_table = self.input_batch.block_table[0]
+
+        for req_id, req_idx in self.input_batch.req_id_to_index.items():
+            num_blocks = block_table.num_blocks_per_row[req_idx]
+            if num_blocks == 0:
+                continue
+
+            block_ids = block_table.block_table.np[
+                req_idx, :num_blocks
+            ].tolist()
+
+            valid = [(pos, bid) for pos, bid in enumerate(block_ids)
+                     if bid != 0]
+            if not valid:
+                continue
+
+            positions, bids = zip(*valid)
+
+            if (captured_query is not None
+                    and req_idx < captured_query.shape[0]):
+                # Q@K attention-based scoring.
+                q = captured_query[req_idx]
+                scores = BlockImportanceScorer.score_blocks_by_attention(
+                    kv_cache=kv_cache,
+                    query=q,
+                    block_ids=list(bids),
+                    block_size=block_size,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                )
+            else:
+                # Fallback: ||V||/||K|| norm-ratio scoring.
+                scores = BlockImportanceScorer.score_blocks(
+                    kv_cache=kv_cache,
+                    block_ids=list(bids),
+                    block_size=block_size,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                )
+
+            result[req_id] = list(zip(positions, scores.tolist()))
+
+        return result if result else None
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4346,6 +4441,11 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                block_importance_scores=(
+                    self._compute_block_importance_scores()
+                    if scheduler_output.compute_block_importance
+                    else None
+                ),
             )
 
         if not self.use_async_scheduling:

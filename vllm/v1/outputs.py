@@ -198,6 +198,12 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # Per-block importance scores for eviction decisions.
+    # Maps req_id -> list of (block_position, score) pairs.
+    # Computed by the worker using PagedEviction ||V||/||K|| ratio
+    # and sent back to the scheduler for cached use during eviction.
+    block_importance_scores: dict[str, list[tuple[int, float]]] | None = None
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

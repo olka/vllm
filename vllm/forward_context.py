@@ -188,6 +188,24 @@ class ForwardContext:
 
 _forward_context: ForwardContext | None = None
 
+# Captured query tensor from the last attention layer's forward pass.
+# Used for Q@K block importance scoring. Each attention layer overwrites
+# this, so after the full model forward, it holds the last layer's Q.
+# CUDA-graph safe: the tensor's GPU memory address is pinned by the graph,
+# so the stored reference remains valid across replays.
+_captured_query: torch.Tensor | None = None
+
+
+def set_captured_query(query: torch.Tensor) -> None:
+    """Store a reference to the current attention layer's query tensor."""
+    global _captured_query
+    _captured_query = query
+
+
+def get_captured_query() -> torch.Tensor | None:
+    """Return the captured query tensor, or None if not available."""
+    return _captured_query
+
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""

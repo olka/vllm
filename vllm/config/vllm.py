@@ -33,6 +33,7 @@ from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
 from .ec_transfer import ECTransferConfig
 from .kernel import KernelConfig
+from .kv_cache_eviction import KVCacheEvictionConfig
 from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
@@ -320,6 +321,8 @@ class VllmConfig:
     """The configurations for distributed KV cache transfer."""
     kv_events_config: KVEventsConfig | None = None
     """The configurations for event publishing."""
+    kv_cache_eviction_config: KVCacheEvictionConfig | None = None
+    """The configurations for KV cache page eviction."""
     ec_transfer_config: ECTransferConfig | None = None
     """The configurations for distributed EC cache transfer."""
     reasoning_config: ReasoningConfig | None = None

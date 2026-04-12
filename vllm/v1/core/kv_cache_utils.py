@@ -126,6 +126,10 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # Monotonic counter stamped when the block is allocated.
+    # Lower values = older content = colder for eviction purposes.
+    last_accessed: int = 0
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash

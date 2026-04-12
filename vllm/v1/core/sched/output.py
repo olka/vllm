@@ -238,6 +238,17 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Incremental GC: blocks evicted this step.
+    # Maps req_id -> list of (kv_cache_group_idx, block_position) pairs that
+    # were replaced with null_block. Workers must zero these positions in
+    # their block tables.
+    evicted_block_positions: dict[str, list[tuple[int, int]]] | None = None
+
+    # When True, the worker computes PagedEviction ||V||/||K|| importance
+    # scores for all blocks of running requests and returns them in
+    # ModelRunnerOutput.block_importance_scores.
+    compute_block_importance: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

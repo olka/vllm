@@ -143,6 +143,11 @@ class KVCacheManager:
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
 
+        # Incremental GC: track evicted blocks per request for page fault
+        # prediction and recomputation.
+        # Maps request_id -> list of EvictedBlockInfo.
+        self.evicted_blocks: dict[str, list] = {}
+
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
         # overhead.
@@ -435,6 +440,67 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+        # Clean up evicted block tracking.
+        self.evicted_blocks.pop(request.request_id, None)
+
+    def evict_blocks_at_positions(
+        self, request_id: str, positions: list[int]
+    ) -> tuple[list[KVCacheBlock], ...]:
+        """Evict blocks at specific positions (page-out).
+
+        Replaces the specified blocks with null_block and frees them back
+        to the pool. Returns the evicted blocks so the caller can capture
+        Quest stats before the block data is overwritten.
+
+        Args:
+            request_id: The request ID.
+            positions: Sorted list of block position indices to evict.
+
+        Returns:
+            Tuple of evicted block lists, one per KV cache group.
+        """
+        return self.coordinator.evict_blocks_at_positions(
+            request_id, positions
+        )
+
+    def get_num_blocks_for_request(self, request_id: str) -> int:
+        """Get the total number of non-null blocks allocated for a request.
+
+        Args:
+            request_id: The request ID.
+
+        Returns:
+            The number of non-null blocks across all KV cache groups.
+        """
+        all_blocks = self.coordinator.get_blocks(request_id)
+        return sum(
+            1 for blocks in all_blocks
+            for b in blocks if not b.is_null
+        )
+
+    def rollback_blocks_from_position(
+        self, request_id: str, start_position: int
+    ) -> int:
+        """Free all blocks from start_position onward for page fault recovery.
+
+        After this call, the request's block list is truncated to
+        start_position blocks. The caller must also reset
+        request.num_computed_tokens accordingly.
+
+        Args:
+            request_id: The request ID.
+            start_position: The first block position to free (inclusive).
+
+        Returns:
+            Total blocks freed.
+        """
+        freed = self.coordinator.free_blocks_from_position(
+            request_id, start_position
+        )
+        # Clear evicted block tracking — the rolled-back region will be
+        # fully recomputed, so previous eviction records are stale.
+        self.evicted_blocks.pop(request_id, None)
+        return freed
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

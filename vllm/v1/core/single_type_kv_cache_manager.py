@@ -399,6 +399,69 @@ class SingleTypeKVCacheManager(ABC):
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_blocks)
 
+    def evict_blocks_at_positions(
+        self, request_id: str, positions: list[int]
+    ) -> list[KVCacheBlock]:
+        """Evict specific blocks by their position index in the request's
+        block list, replacing them with null_block.
+
+        This is the core operation for KV cache page eviction.
+        It mirrors the pattern of remove_skipped_blocks() but operates on
+        arbitrary positions rather than a contiguous head region.
+
+        Args:
+            request_id: The request ID.
+            positions: Sorted list of position indices in req_to_blocks to
+                evict.
+
+        Returns:
+            The evicted KVCacheBlock objects (for caller to capture stats
+            before the block data is overwritten).
+        """
+        blocks = self.req_to_blocks[request_id]
+        evicted: list[KVCacheBlock] = []
+
+        for pos in positions:
+            block = blocks[pos]
+            if block.is_null:
+                continue
+            evicted.append(block)
+            blocks[pos] = self._null_block
+
+        # Free in reverse order for correct LRU ordering (tail blocks
+        # should be evicted first from the free queue).
+        self.block_pool.free_blocks(reversed(evicted))
+        return evicted
+
+    def free_blocks_from_position(
+        self, request_id: str, start_position: int
+    ) -> int:
+        """Free all blocks from start_position onward (inclusive).
+
+        Used for page fault recovery: roll back to the first evicted block
+        and let normal prefill recompute from there.
+
+        Args:
+            request_id: The request ID.
+            start_position: The first block position to free.
+
+        Returns:
+            Number of blocks freed.
+        """
+        blocks = self.req_to_blocks[request_id]
+        if start_position >= len(blocks):
+            return 0
+
+        removed: list[KVCacheBlock] = []
+        for i in range(len(blocks) - 1, start_position - 1, -1):
+            block = blocks[i]
+            if not block.is_null:
+                removed.append(block)
+        # Truncate the block list.
+        del blocks[start_position:]
+        self.block_pool.free_blocks(removed)
+        return len(removed)
+
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
         Get the number of tokens that will be skipped for attention computation.

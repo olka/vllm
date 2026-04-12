@@ -163,6 +163,26 @@ class BlockTable:
             BLOCK_SIZE=1024,
         )
 
+    def zero_block_positions(self, row_idx: int, positions: list[int]) -> None:
+        """Set specific block positions to 0 (null block) for page eviction.
+
+        This is used when blocks are evicted from the middle of a request's
+        KV cache. The null block (ID 0) has zeroed KV data, so attention
+        will effectively skip these positions.
+
+        Args:
+            row_idx: The row index in the block table.
+            positions: List of block position indices to zero out.
+        """
+        for pos in positions:
+            if self.use_hybrid_blocks:
+                # Each logical block maps to blocks_per_kv_block kernel blocks.
+                start = pos * self.blocks_per_kv_block
+                end = start + self.blocks_per_kv_block
+                self.block_table.np[row_idx, start:end] = 0
+            else:
+                self.block_table.np[row_idx, pos] = 0
+
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table.copy_to_gpu(num_reqs)
 

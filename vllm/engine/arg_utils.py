@@ -40,6 +40,7 @@ from vllm.config import (
     DeviceConfig,
     ECTransferConfig,
     EPLBConfig,
+    KVCacheEvictionConfig,
     KernelConfig,
     KVEventsConfig,
     KVTransferConfig,
@@ -619,6 +620,7 @@ class EngineArgs:
 
     kv_transfer_config: KVTransferConfig | None = None
     kv_events_config: KVEventsConfig | None = None
+    kv_cache_eviction_config: KVCacheEvictionConfig | None = None
 
     ec_transfer_config: ECTransferConfig | None = None
     reasoning_config: ReasoningConfig = get_field(VllmConfig, "reasoning_config")
@@ -1385,6 +1387,10 @@ class EngineArgs:
         )
         vllm_group.add_argument("--kv-events-config", **vllm_kwargs["kv_events_config"])
         vllm_group.add_argument(
+            "--kv-cache-eviction-config",
+            **vllm_kwargs["kv_cache_eviction_config"],
+        )
+        vllm_group.add_argument(
             "--ec-transfer-config", **vllm_kwargs["ec_transfer_config"]
         )
         vllm_group.add_argument(
@@ -2136,6 +2142,7 @@ class EngineArgs:
             compilation_config=compilation_config,
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
+            kv_cache_eviction_config=self.kv_cache_eviction_config,
             ec_transfer_config=self.ec_transfer_config,
             reasoning_config=self.reasoning_config,
             profiler_config=self.profiler_config,
