@@ -85,13 +85,13 @@ _HTML_TEMPLATE = """\
                     </div>
                     <div class="flex items-center gap-2">
                         <span class="w-3.5 h-3.5 rounded-sm flex-shrink-0"
-                              style="background:#d44842"></span>
-                        <span>Warm</span>
+                              style="background:#ed7953"></span>
+                        <span>Warm (≥ 0.08)</span>
                     </div>
                     <div class="flex items-center gap-2">
                         <span class="w-3.5 h-3.5 rounded-sm flex-shrink-0"
-                              style="background:#f0f921"></span>
-                        <span>Hot (high attention)</span>
+                              style="background:#d44842"></span>
+                        <span>Hot (≥ 0.10)</span>
                     </div>
                 </div>
             </div>
@@ -160,16 +160,15 @@ _CHART_TEMPLATE = """\
     var yCats = [];
     for (var i = 0; i < rows; i++) yCats.push(i);
 
-    // Build heatmap data: [x, y, logScore, blockPos, state, rawScore]
-    // Log scale: scores span 0.00002..1.6 (73000x range), linear colormap
-    // squashes everything to blue. Log10 spreads the full dynamic range.
+    // Build heatmap data: [x, y, score, blockPos, state, rawScore]
+    // Linear value-based: visualMap range [0, 0.1] with palette
+    // anchored so 0.08 lands at orange (warm) and 0.10 at red (hot).
     var heatData = [];
     for (var i = 0; i < data.length; i++) {
         var x = i % cols;
         var y = Math.floor(i / cols);
         var raw = data[i][1];
-        var logVal = raw > 0 ? Math.log10(raw) : -10;
-        heatData.push([x, y, logVal, data[i][0], data[i][2], raw]);
+        heatData.push([x, y, raw, data[i][0], data[i][2], raw]);
     }
 
     var stateNames = {0: 'Active', 1: 'Protected head', 2: 'Protected tail', 3: 'Evicted'};
@@ -216,11 +215,11 @@ _CHART_TEMPLATE = """\
             itemHeight: 120,
             textStyle: { color: '#666', fontSize: 10 },
             formatter: function(v) {
-                return Math.pow(10, v).toExponential(0);
+                return v.toFixed(3);
             },
             inRange: {
-                color: ['#0d0887', '#3b049a', '#7201a8', '#a52c60',
-                        '#d44842', '#ed7953', '#fca636', '#f0f921']
+                color: ['#0d0887', '#3b049a', '#2563eb',
+                        '#fdae61', '#ed7953', '#d44842']
             }
         },
         series: [{
@@ -341,11 +340,18 @@ def write_heatmap(
         min_s = min(all_vals)
         max_s = max(all_vals)
         ratio = max_s / max(min_s, 1e-10)
-        # Log10 bounds for colormap — spreads the full dynamic range.
-        log_min = math.log10(max(min_s, 1e-10))
-        log_max = math.log10(max(max_s, 1e-10))
+        # Linear value-based color mapping with explicit thresholds:
+        #   bounds [0, 0.1], palette [purple, purple, blue, orange, red].
+        # 0.08 -> ~80% -> orange (warm threshold).
+        # 0.10 -> 100% -> red (hot).
+        # Anything above 0.10 clamps to red. Cold differentiation below
+        # 0.08 is intentionally sacrificed for clear absolute thresholds —
+        # log scale and rank-based both made it too hard to reason about
+        # which color means what score.
+        log_min = 0.0
+        log_max = 0.1
 
-        # Block data: [block_pos, score, state]
+        # Block data: [block_pos, score, state]. JS reads d[1] for color.
         block_data = []
         for pos in range(total):
             score = scores.get(pos, 0.0)
