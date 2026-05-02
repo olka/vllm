@@ -495,6 +495,11 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        # KV swap worker — lazily created on first swap directive when
+        # the eviction config has enable_swap=True. None when disabled.
+        from vllm.v1.worker.kv_swap_worker import KVSwapWorker
+        self._kv_swap_worker_cls = KVSwapWorker
+        self._kv_swap_worker: KVSwapWorker | None = None
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -3801,19 +3806,15 @@ class GPUModelRunner(
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
     def _compute_block_importance_scores(
-        self,
+        self, strategy_name: str | None,
     ) -> dict[str, list[tuple[int, float]]] | None:
-        """Compute block importance scores using Q@K attention scoring.
+        """Compute block importance scores via the configured strategy.
 
-        Uses the captured query tensor from the last attention layer to
-        compute actual attention scores against the last layer's KV cache.
-        Falls back to ||V||/||K|| norm-ratio if Q is not available.
-
-        Returns:
-            Maps req_id -> list of (block_position, score) pairs,
-            or None if scoring is not possible.
+        Dispatches to ``EvictionStrategy.create(strategy_name).compute_worker_scores``.
+        Returns ``None`` if scoring is impossible (no KV cache yet, no
+        strategy configured, or the strategy doesn't need worker scoring).
         """
-        if not self.kv_caches:
+        if strategy_name is None or not self.kv_caches:
             return None
 
         # Use last layer's KV cache — matches the captured Q (also last layer).
@@ -3824,7 +3825,11 @@ class GPUModelRunner(
             return None
 
         from vllm.forward_context import get_captured_query
-        from vllm.v1.core.block_importance import BlockImportanceScorer
+        from vllm.v1.core.kv_cache_eviction_strategy import EvictionStrategy
+
+        strategy = EvictionStrategy.create(strategy_name)
+        if not strategy.needs_worker_scoring:
+            return None
 
         _, num_blocks_total, block_size, num_kv_heads, head_size = (
             kv_cache.shape
@@ -3851,27 +3856,19 @@ class GPUModelRunner(
 
             positions, bids = zip(*valid)
 
+            query = None
             if (captured_query is not None
                     and req_idx < captured_query.shape[0]):
-                # Q@K attention-based scoring.
-                q = captured_query[req_idx]
-                scores = BlockImportanceScorer.score_blocks_by_attention(
-                    kv_cache=kv_cache,
-                    query=q,
-                    block_ids=list(bids),
-                    block_size=block_size,
-                    num_kv_heads=num_kv_heads,
-                    head_size=head_size,
-                )
-            else:
-                # Fallback: ||V||/||K|| norm-ratio scoring.
-                scores = BlockImportanceScorer.score_blocks(
-                    kv_cache=kv_cache,
-                    block_ids=list(bids),
-                    block_size=block_size,
-                    num_kv_heads=num_kv_heads,
-                    head_size=head_size,
-                )
+                query = captured_query[req_idx]
+
+            scores = strategy.compute_worker_scores(
+                kv_cache=kv_cache,
+                block_ids=list(bids),
+                block_size=block_size,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                query=query,
+            )
 
             result[req_id] = list(zip(positions, scores.tolist()))
 
@@ -3895,6 +3892,36 @@ class GPUModelRunner(
                 capturer.clear_buffer()  # noqa
             else:
                 logger.error("RoutedExpertsCapturer not initialized.")
+
+        # KV swap-out: kick off async D2H + tier placement for blocks
+        # the scheduler evicted. The scheduler keeps those gpu_block_ids
+        # pinned until our completion ack lands in absorb_output.
+        swap_directives = scheduler_output.swap_out_blocks
+        if swap_directives:
+            if self._kv_swap_worker is None and self.kv_caches:
+                cfg = self.vllm_config.kv_cache_eviction_config
+                if cfg is not None and cfg.enable_swap:
+                    self._kv_swap_worker = self._kv_swap_worker_cls(
+                        cfg.swap_dir, self.kv_caches,
+                        cpu_tier_capacity_bytes=(
+                            cfg.cpu_tier_capacity_bytes
+                        ),
+                    )
+            if self._kv_swap_worker is not None:
+                self._kv_swap_worker.submit_swap_outs(swap_directives)
+        # KV swap-in: pull bytes back into freshly-allocated GPU blocks
+        # for the directives the scheduler queued at this step's
+        # _handle_page_faults.
+        swap_in_directives = scheduler_output.swap_in_blocks
+        if swap_in_directives and self._kv_swap_worker is not None:
+            self._kv_swap_worker.submit_swap_ins(swap_in_directives)
+        # Release CPU tier entries for finished requests. Disk files
+        # (when present) are unlinked on the scheduler side via
+        # SwapStore; this only clears the in-memory L2 pool.
+        if (self._kv_swap_worker is not None
+                and scheduler_output.finished_req_ids):
+            for req_id in scheduler_output.finished_req_ids:
+                self._kv_swap_worker.drop_request_state(req_id)
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -4429,6 +4456,15 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            # Drain swap-in results once (the call mutates internal
+            # queues); pass both halves into ModelRunnerOutput.
+            if self._kv_swap_worker is not None:
+                _swap_in_done, _swap_in_failed = (
+                    self._kv_swap_worker.collect_swap_in_results()
+                )
+            else:
+                _swap_in_done, _swap_in_failed = None, None
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -4442,10 +4478,18 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 block_importance_scores=(
-                    self._compute_block_importance_scores()
+                    self._compute_block_importance_scores(
+                        scheduler_output.eviction_strategy_name
+                    )
                     if scheduler_output.compute_block_importance
                     else None
                 ),
+                swap_out_completed=(
+                    self._kv_swap_worker.collect_completed()
+                    if self._kv_swap_worker is not None else None
+                ),
+                swap_in_completed=_swap_in_done,
+                swap_in_failed=_swap_in_failed,
             )
 
         if not self.use_async_scheduling:

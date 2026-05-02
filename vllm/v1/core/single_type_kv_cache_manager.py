@@ -399,8 +399,37 @@ class SingleTypeKVCacheManager(ABC):
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_blocks)
 
+    def attach_block_at_position(
+        self, request_id: str, position: int, block: KVCacheBlock,
+    ) -> None:
+        """Re-attach a previously-evicted block at ``position``.
+
+        Used by swap-in: after the worker has restored the K/V bytes
+        into a freshly-allocated GPU block, the scheduler patches the
+        request's block table here so subsequent attention reads find
+        the block at its original logical position. The slot must
+        currently hold ``null_block`` — re-attaching to a non-null
+        slot would clobber a live block.
+        """
+        blocks = self.req_to_blocks[request_id]
+        if position >= len(blocks):
+            raise IndexError(
+                f"attach_block_at_position: req={request_id} "
+                f"position={position} but block list has "
+                f"{len(blocks)} entries"
+            )
+        if not blocks[position].is_null:
+            raise ValueError(
+                f"attach_block_at_position: req={request_id} "
+                f"position={position} is not null "
+                f"(holds block_id={blocks[position].block_id}); "
+                f"refusing to clobber a live block"
+            )
+        blocks[position] = block
+
     def evict_blocks_at_positions(
-        self, request_id: str, positions: list[int]
+        self, request_id: str, positions: list[int],
+        free_immediately: bool = True,
     ) -> list[KVCacheBlock]:
         """Evict specific blocks by their position index in the request's
         block list, replacing them with null_block.
@@ -413,6 +442,14 @@ class SingleTypeKVCacheManager(ABC):
             request_id: The request ID.
             positions: Sorted list of position indices in req_to_blocks to
                 evict.
+            free_immediately: If True (default), the evicted blocks are
+                returned to the pool's free queue immediately. If False,
+                blocks are only detached from the request's block table
+                — the caller is responsible for eventually freeing them
+                via ``block_pool.free_blocks``. Used by swap-out: the
+                block id must stay pinned until the worker has copied
+                its KV bytes to disk, otherwise reuse races the swap-out
+                copy.
 
         Returns:
             The evicted KVCacheBlock objects (for caller to capture stats
@@ -428,9 +465,10 @@ class SingleTypeKVCacheManager(ABC):
             evicted.append(block)
             blocks[pos] = self._null_block
 
-        # Free in reverse order for correct LRU ordering (tail blocks
-        # should be evicted first from the free queue).
-        self.block_pool.free_blocks(reversed(evicted))
+        if free_immediately:
+            # Free in reverse order for correct LRU ordering (tail blocks
+            # should be evicted first from the free queue).
+            self.block_pool.free_blocks(reversed(evicted))
         return evicted
 
     def free_blocks_from_position(

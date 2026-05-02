@@ -244,10 +244,29 @@ class SchedulerOutput:
     # their block tables.
     evicted_block_positions: dict[str, list[tuple[int, int]]] | None = None
 
-    # When True, the worker computes PagedEviction ||V||/||K|| importance
-    # scores for all blocks of running requests and returns them in
-    # ModelRunnerOutput.block_importance_scores.
+    # When True, the worker computes block importance scores for all
+    # blocks of running requests and returns them in
+    # ModelRunnerOutput.block_importance_scores. The specific scoring
+    # method is dispatched via `eviction_strategy_name`.
     compute_block_importance: bool = False
+    eviction_strategy_name: str | None = None
+
+    # KV cache swap-out directives for this step. Each tuple is
+    # (req_id, kv_cache_group_idx, block_position, gpu_block_id). The
+    # worker copies the block's KV bytes to disk and acks via
+    # ModelRunnerOutput.swap_out_completed. The scheduler keeps the
+    # gpu_block_id pinned (out of the free pool) until ack arrives.
+    swap_out_blocks: list[tuple[str, int, int, int]] | None = None
+
+    # KV cache swap-in directives for this step. Each tuple is
+    # (req_id, kv_cache_group_idx, block_position, fresh_gpu_block_id).
+    # The fresh block has been freshly allocated by the scheduler and
+    # is awaiting the worker to fill it with the K/V bytes for the
+    # named (req, group, pos). Worker acks via
+    # ``ModelRunnerOutput.swap_in_completed`` (success) or
+    # ``swap_in_failed`` (bytes lost — caller will fall back to
+    # rollback on the next page-fault cycle).
+    swap_in_blocks: list[tuple[str, int, int, int]] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

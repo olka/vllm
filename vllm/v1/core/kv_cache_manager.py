@@ -443,24 +443,82 @@ class KVCacheManager:
         # Clean up evicted block tracking.
         self.evicted_blocks.pop(request.request_id, None)
 
+    def attach_block_at_position(
+        self,
+        request_id: str,
+        kv_cache_group_idx: int,
+        position: int,
+        block: "KVCacheBlock",
+    ) -> None:
+        """Re-attach a swapped-in block at ``position`` in the request's
+        block table for the given KV cache group.
+
+        The slot at ``position`` must currently be ``null_block`` (was
+        previously evicted). This is the symmetric counterpart of
+        ``evict_blocks_at_positions(free_immediately=False)``: the
+        caller obtained ``block`` from a fresh ``block_pool`` allocation
+        and the worker has filled it with the K/V bytes for this
+        position; this method makes the bytes visible to the model.
+        """
+        self.coordinator.attach_block_at_position(
+            request_id, kv_cache_group_idx, position, block,
+        )
+
+    def unrecord_evicted(
+        self, request_id: str, position: int,
+    ) -> bool:
+        """Drop the per-position eviction record for a request.
+
+        Used by swap-in completion: once the bytes are back on the GPU
+        and the block table is patched, the position is no longer
+        evicted, and ``self.evicted_blocks`` should not list it. If
+        the request has no remaining evicted positions, the per-request
+        entry is removed entirely.
+
+        Returns True if a record was found and removed; False otherwise.
+        """
+        evicted_list = self.evicted_blocks.get(request_id)
+        if evicted_list is None:
+            return False
+        idx = next(
+            (
+                i for i, info in enumerate(evicted_list)
+                if info.quest_stats.block_position == position
+            ),
+            None,
+        )
+        if idx is None:
+            return False
+        evicted_list.pop(idx)
+        if not evicted_list:
+            self.evicted_blocks.pop(request_id, None)
+        return True
+
     def evict_blocks_at_positions(
-        self, request_id: str, positions: list[int]
+        self, request_id: str, positions: list[int],
+        free_immediately: bool = True,
     ) -> tuple[list[KVCacheBlock], ...]:
         """Evict blocks at specific positions (page-out).
 
-        Replaces the specified blocks with null_block and frees them back
-        to the pool. Returns the evicted blocks so the caller can capture
-        Quest stats before the block data is overwritten.
+        Replaces the specified blocks with null_block and (when
+        ``free_immediately``) frees them back to the pool. Returns the
+        evicted blocks so the caller can capture Quest stats — or, in
+        swap mode, retain references and free explicitly once swap-out
+        completes.
 
         Args:
             request_id: The request ID.
             positions: Sorted list of block position indices to evict.
+            free_immediately: If False, blocks are detached from the
+                block table but kept allocated. Caller must free them
+                via ``self.block_pool.free_blocks`` once they're safe
+                to recycle (e.g., after worker swap-out ack).
 
         Returns:
             Tuple of evicted block lists, one per KV cache group.
         """
         return self.coordinator.evict_blocks_at_positions(
-            request_id, positions
+            request_id, positions, free_immediately=free_immediately,
         )
 
     def get_num_blocks_for_request(self, request_id: str) -> int:

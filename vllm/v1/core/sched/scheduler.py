@@ -36,6 +36,7 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.core.kv_cache_eviction_manager import KVCacheEvictionManager
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -83,22 +84,8 @@ class Scheduler(SchedulerInterface):
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.eviction_config = vllm_config.kv_cache_eviction_config
-        if self.eviction_config is not None:
-            logger.error(
-                "KV cache eviction config loaded: enable=%s, "
-                "scoring_strategy=%s, proactive_threshold=%.2f",
-                self.eviction_config.enable,
-                self.eviction_config.scoring_strategy,
-                self.eviction_config.proactive_eviction_threshold,
-            )
-        # Cached block importance scores from the worker (PagedEviction).
-        # Maps req_id -> dict(block_position -> score).
-        self._block_importance_cache: dict[str, dict[int, float]] = {}
-        # Persistent cooldown: request IDs that were recently rolled back.
-        # Cleared only when the request finishes, NOT each step.
-        # Prevents thrashing: evict → rollback → recompute → evict again.
-        self._eviction_cooldown_req_ids: set[str] = set()
-        self._heatmap_write_counter: int = 0
+        # Eviction manager wired in after kv_cache_manager is built (below).
+        self._eviction_mgr: KVCacheEvictionManager | None = None
         self.log_stats = log_stats
         self.observability_config = vllm_config.observability_config
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
@@ -258,6 +245,17 @@ class Scheduler(SchedulerInterface):
         ):
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
+        if self.eviction_config is not None and self.eviction_config.enable:
+            self._eviction_mgr = KVCacheEvictionManager(
+                config=self.eviction_config,
+                kv_cache_manager=self.kv_cache_manager,
+                running=self.running,
+                requests=self.requests,
+                max_model_len=self.max_model_len,
+                block_size=self.block_size,
+                model_name=self.vllm_config.model_config.model,
+            )
+
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         self.scheduler_reserve_full_isl = (
@@ -397,39 +395,12 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        self._rolled_back_req_ids: set[str] = set()
-        if self.eviction_config is not None and self.eviction_config.enable:
-            threshold = self.eviction_config.proactive_eviction_threshold
-            if not hasattr(self, '_eviction_log_counter'):
-                self._eviction_log_counter = 0
-            self._eviction_log_counter += 1
-
-            for request in list(self.running):
-                context_fill = (request.num_computed_tokens
-                                / self.max_model_len)
-                if self._eviction_log_counter % 100 == 1:
-                    logger.error(
-                        "Eviction check step=%d: req %s "
-                        "context_fill=%.1f%% (%d/%d tokens), "
-                        "threshold=%.1f%%, cooldown=%s",
-                        self._eviction_log_counter,
-                        request.request_id,
-                        context_fill * 100,
-                        request.num_computed_tokens,
-                        self.max_model_len,
-                        threshold * 100,
-                        request.request_id
-                        in self._eviction_cooldown_req_ids,
-                    )
-                if context_fill > threshold:
-                    if request.request_id \
-                            not in self._eviction_cooldown_req_ids:
-                        self._try_evict_pages_from_request(request)
-
-            # Handle page faults: rollback evicted blocks so chunked
-            # prefill recomputes them. Runs AFTER proactive eviction
-            # so blocks evicted above get rolled back in the same step.
-            self._handle_page_faults()
+        # Proactive eviction sweep + page-fault rollback. The returned set
+        # is read off self._rolled_back_req_ids by L579/L1527/L1532 below.
+        if self._eviction_mgr is not None:
+            self._rolled_back_req_ids = self._eviction_mgr.before_schedule()
+        else:
+            self._rolled_back_req_ids = set()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -523,14 +494,10 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Try page eviction first before full preemption.
-                    if self.eviction_config is not None \
-                            and self.eviction_config.enable:
-                        freed = self._try_evict_pages(
-                            num_blocks_needed=1,
-                            exclude_request=request,
-                        )
-                        if freed > 0:
-                            continue
+                    if (self._eviction_mgr is not None and
+                            self._eviction_mgr.try_free_blocks(
+                                num_needed=1, exclude=request)):
+                        continue
 
                     # Page eviction insufficient — fall back to full
                     # preemption of the lowest-priority request.
@@ -987,20 +954,10 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
-        # Request GPU importance scores every 10 steps when approaching
-        # eviction threshold — scores are cached and don't change fast.
-        if not hasattr(self, '_bi_step_counter'):
-            self._bi_step_counter = 0
-        self._bi_step_counter += 1
         _compute_bi = (
-            self.eviction_config is not None
-            and self.eviction_config.enable
-            and self._bi_step_counter % 50 == 0
-            and any(
-                r.num_computed_tokens / self.max_model_len
-                > self.eviction_config.proactive_eviction_threshold * 0.9
-                for r in scheduled_running_reqs
-            )
+            self._eviction_mgr is not None
+            and self._eviction_mgr.should_request_block_importance(
+                scheduled_running_reqs)
         )
 
         scheduler_output = SchedulerOutput(
@@ -1020,6 +977,18 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             compute_block_importance=_compute_bi,
+            eviction_strategy_name=(
+                self._eviction_mgr.strategy_name
+                if self._eviction_mgr is not None else None
+            ),
+            swap_out_blocks=(
+                self._eviction_mgr.take_swap_directives()
+                if self._eviction_mgr is not None else None
+            ),
+            swap_in_blocks=(
+                self._eviction_mgr.take_swap_in_directives()
+                if self._eviction_mgr is not None else None
+            ),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1068,352 +1037,6 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
 
-    def _handle_page_faults(self) -> None:
-        """Check running requests for evicted blocks and trigger rollback.
-
-        For each request that has evicted blocks, rolls back
-        num_computed_tokens to the first eviction point and frees all
-        blocks from there onward. The normal scheduling loop will then
-        treat this as a chunked prefill and recompute those tokens.
-
-        Only triggers rollback when the block pool has enough free blocks
-        to make recomputation feasible (at least 10% free).
-        """
-        evicted_map = self.kv_cache_manager.evicted_blocks
-        if not evicted_map:
-            return
-
-        # Only attempt recovery when there's memory headroom.
-        usage = self.kv_cache_manager.usage
-        if usage > self.eviction_config.page_fault_usage_threshold:
-            return
-
-        # Process a copy of keys since we modify evicted_map during
-        # iteration (via rollback_blocks_from_position).
-        for request_id in list(evicted_map.keys()):
-            # Find the request in the running queue.
-            request = self.requests.get(request_id)
-            if request is None or request.status != RequestStatus.RUNNING:
-                # Request finished or preempted — clean up stale entry.
-                evicted_map.pop(request_id, None)
-                continue
-
-            evicted_blocks = evicted_map[request_id]
-            if not evicted_blocks:
-                evicted_map.pop(request_id, None)
-                continue
-
-            # Find the earliest eviction point.
-            earliest_pos = min(
-                info.quest_stats.block_position
-                for info in evicted_blocks
-            )
-
-            # Roll back: free all blocks from the eviction point onward.
-            self.kv_cache_manager.rollback_blocks_from_position(
-                request_id, earliest_pos
-            )
-
-            # Reset num_computed_tokens to the eviction point.
-            new_computed = earliest_pos * self.block_size
-            old_computed = request.num_computed_tokens
-            request.num_computed_tokens = min(
-                new_computed, request.num_computed_tokens
-            )
-            logger.error(
-                "Page fault rollback: req %s, %d -> %d computed tokens",
-                request_id, old_computed, request.num_computed_tokens,
-            )
-
-            # Clear spec tokens since KV state changed.
-            if request.spec_token_ids:
-                request.spec_token_ids = []
-
-            # Track rolled-back requests so they're treated as "resumed"
-            # on the worker side — the worker removes them from the
-            # persistent batch and re-adds with the correct block table.
-            self._rolled_back_req_ids.add(request_id)
-
-            # Persistent cooldown: don't evict from this request again
-            # until it finishes. Prevents thrashing loop.
-            self._eviction_cooldown_req_ids.add(request_id)
-
-            # Clear eviction metadata — rollback handled it.
-            evicted_map.pop(request_id, None)
-
-    def _try_evict_pages(
-        self,
-        num_blocks_needed: int,
-        exclude_request: Request | None = None,
-    ) -> int:
-        """Try to free blocks by evicting cold KV cache pages.
-
-        Selects the running request with the most allocated blocks as the
-        victim, then evicts its lowest-importance blocks.
-
-        Args:
-            num_blocks_needed: How many blocks we need to free.
-            exclude_request: Request to exclude from victim selection
-                (the one we're trying to allocate for).
-
-        Returns:
-            Number of blocks actually freed.
-        """
-        victim = self._select_eviction_victim(exclude_request)
-        if victim is None:
-            return 0
-
-        # Get the victim's block list to find eviction candidates.
-        all_blocks = self.kv_cache_manager.coordinator.get_blocks(
-            victim.request_id
-        )
-        if not all_blocks:
-            return 0
-        blocks = max(all_blocks, key=len)
-
-        total_blocks = len(blocks)
-        # Determine evictable positions (non-null blocks, excluding
-        # protected head/tail).
-        cfg = self.eviction_config
-        num_protected_head = min(cfg.num_protected_head_blocks, total_blocks)
-        num_protected_tail = min(
-            cfg.num_protected_tail_blocks,
-            total_blocks - num_protected_head,
-        )
-        tail_start = total_blocks - num_protected_tail
-
-        evictable = [
-            (i, b) for i, b in enumerate(blocks)
-            if not b.is_null
-            and i >= num_protected_head
-            and i < tail_start
-        ]
-
-        if not evictable:
-            return 0
-
-        # Score and sort evictable blocks.
-        importance = self._block_importance_cache.get(victim.request_id)
-        if (cfg.scoring_strategy == "paged_eviction"
-                and importance is not None):
-            evictable.sort(
-                key=lambda ib: importance.get(ib[0], 0.0))
-        else:
-            evictable.sort(key=lambda ib: ib[1].last_accessed)
-
-        max_evict = max(1, int(total_blocks * cfg.max_eviction_fraction))
-        num_to_evict = min(num_blocks_needed, max_evict,
-                           len(evictable))
-        to_evict = evictable[:num_to_evict]
-        positions_to_evict = [pos for pos, _ in to_evict]
-
-        block_details = []
-        for pos, blk in to_evict:
-            imp_score = (importance.get(pos, None)
-                         if importance is not None else None)
-            detail = (f"pos={pos} access_ts={blk.last_accessed}"
-                      f" importance={imp_score}")
-            block_details.append(detail)
-
-        logger.error(
-            "Page eviction (reactive): req %s, %d/%d blocks evicted "
-            "(strategy=%s) blocks=[%s]",
-            victim.request_id,
-            len(positions_to_evict),
-            total_blocks,
-            cfg.scoring_strategy,
-            ", ".join(block_details),
-        )
-
-        self.kv_cache_manager.evict_blocks_at_positions(
-            victim.request_id, positions_to_evict
-        )
-
-        # Record eviction metadata for page fault handling.
-        # We use lightweight placeholders — full Quest stats capture
-        # requires GPU access which happens on the worker side.
-        from vllm.v1.core.block_importance import EvictedBlockInfo, QuestBlockStats
-        evicted_list = self.kv_cache_manager.evicted_blocks.setdefault(
-            victim.request_id, []
-        )
-        for pos in positions_to_evict:
-            evicted_list.append(EvictedBlockInfo(
-                quest_stats=QuestBlockStats(
-                    key_min=None,  # type: ignore[arg-type]
-                    key_max=None,  # type: ignore[arg-type]
-                    token_ids=[],
-                    position_start=pos * self.block_size,
-                    position_end=(pos + 1) * self.block_size,
-                    block_position=pos,
-                ),
-                kv_cache_group_id=0,
-            ))
-
-        # Clear spec tokens since KV cache changed.
-        if victim.spec_token_ids:
-            victim.spec_token_ids = []
-
-        return len(positions_to_evict)
-
-    def _select_eviction_victim(
-        self, exclude_request: Request | None = None
-    ) -> Request | None:
-        """Select the running request with the most blocks for page eviction.
-
-        Args:
-            exclude_request: Request to exclude from selection.
-
-        Returns:
-            The victim request, or None if no suitable victim found.
-        """
-        best: Request | None = None
-        best_blocks = 0
-
-        for req in self.running:
-            if req is exclude_request:
-                continue
-            num_blocks = self.kv_cache_manager.get_num_blocks_for_request(
-                req.request_id
-            )
-            if num_blocks > best_blocks:
-                best_blocks = num_blocks
-                best = req
-
-        # Only evict from requests with enough blocks to be worth it.
-        if best_blocks < self.eviction_config.min_blocks_for_eviction:
-            return None
-        return best
-
-    def _try_evict_pages_from_request(self, request: Request) -> int:
-        """Evict cold blocks from a specific request.
-
-        Unlike _try_evict_pages (which selects a victim), this targets
-        the given request directly — used by proactive eviction to
-        free blocks from the largest requests.
-
-        Returns:
-            Number of blocks evicted.
-        """
-        all_blocks = self.kv_cache_manager.coordinator.get_blocks(
-            request.request_id
-        )
-        if not all_blocks:
-            return 0
-
-        # Find the largest KV cache group (the main attention cache).
-        blocks = max(all_blocks, key=len)
-        total_blocks = len(blocks)
-
-        cfg = self.eviction_config
-        if total_blocks < cfg.min_blocks_for_eviction:
-            return 0
-
-        num_protected_head = min(cfg.num_protected_head_blocks, total_blocks)
-        num_protected_tail = min(
-            cfg.num_protected_tail_blocks,
-            total_blocks - num_protected_head,
-        )
-        tail_start = total_blocks - num_protected_tail
-
-        evictable = [
-            (i, b) for i, b in enumerate(blocks)
-            if not b.is_null
-            and i >= num_protected_head
-            and i < tail_start
-        ]
-
-        if not evictable:
-            return 0
-
-        # Score and sort evictable blocks.
-        # Primary: GPU importance (lowest = coldest, evict first).
-        # Tiebreaker: LRU (oldest allocation time first).
-        importance = self._block_importance_cache.get(request.request_id)
-        if importance is None:
-            # No Q@K scores yet — skip proactive eviction until we have
-            # real attention data. This is preventive, not urgent.
-            return 0
-
-        evictable.sort(
-            key=lambda ib: (importance.get(ib[0], 0.0),
-                            ib[1].last_accessed))
-
-        max_evict = max(1, int(total_blocks * cfg.max_eviction_fraction))
-
-        # Absolute threshold: a block is dead if its EMA attention score is
-        # below epsilon. KV cache attention is bimodal (hot vs cold) — relative
-        # thresholds like 0.5*avg misrepresent both populations.
-        epsilon = cfg.dead_block_epsilon
-        dead_blocks = [
-            (pos, blk) for pos, blk in evictable
-            if importance.get(pos, 0.0) < epsilon
-        ]
-        if not dead_blocks:
-            return 0
-        num_to_evict = min(max_evict, len(dead_blocks))
-        to_evict = dead_blocks[:num_to_evict]
-        positions_to_evict = [pos for pos, _ in to_evict]
-
-        # Build per-block score details for logging.
-        block_details = []
-        for pos, blk in to_evict:
-            imp_score = (importance.get(pos, None)
-                         if importance is not None else None)
-            detail = (f"pos={pos} score={imp_score:.6f}"
-                      if imp_score is not None
-                      else f"pos={pos} score=None")
-            block_details.append(detail)
-
-        # Compute score range across ALL blocks for context.
-        if importance:
-            all_scores = list(importance.values())
-            score_summary = (
-                f" score_range=[{min(all_scores):.6f}"
-                f"..{max(all_scores):.6f}]"
-                f" ratio={max(all_scores)/max(min(all_scores),1e-10):.0f}x"
-            )
-        else:
-            score_summary = ""
-
-        logger.error(
-            "Page eviction (Q@K): req %s, %d/%d blocks evicted "
-            "(dead < ε=%.1e)%s blocks=[%s]",
-            request.request_id,
-            len(positions_to_evict),
-            total_blocks,
-            epsilon,
-            score_summary,
-            ", ".join(block_details),
-        )
-
-        self.kv_cache_manager.evict_blocks_at_positions(
-            request.request_id, positions_to_evict
-        )
-
-        from vllm.v1.core.block_importance import (
-            EvictedBlockInfo,
-            QuestBlockStats,
-        )
-        evicted_list = self.kv_cache_manager.evicted_blocks.setdefault(
-            request.request_id, []
-        )
-        for pos in positions_to_evict:
-            evicted_list.append(EvictedBlockInfo(
-                quest_stats=QuestBlockStats(
-                    key_min=None,  # type: ignore[arg-type]
-                    key_max=None,  # type: ignore[arg-type]
-                    token_ids=[],
-                    position_start=pos * self.block_size,
-                    position_end=(pos + 1) * self.block_size,
-                    block_position=pos,
-                ),
-                kv_cache_group_id=0,
-            ))
-
-        if request.spec_token_ids:
-            request.spec_token_ids = []
-
-        return len(positions_to_evict)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1741,33 +1364,8 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        # Update block importance scores with EMA (exponential moving average).
-        # Smooths per-step attention fluctuations into a stable importance
-        # signal for eviction and heatmap visualization.
-        if model_runner_output.block_importance_scores:
-            ema_alpha = 0.3  # weight for new observation
-            for req_id, scores in (
-                model_runner_output.block_importance_scores.items()
-            ):
-                existing = self._block_importance_cache.get(req_id)
-                if existing is None:
-                    # First observation — initialize directly.
-                    self._block_importance_cache[req_id] = {
-                        pos: score for pos, score in scores
-                    }
-                else:
-                    for pos, score in scores:
-                        if pos in existing:
-                            existing[pos] = ((1 - ema_alpha) * existing[pos]
-                                             + ema_alpha * score)
-                        else:
-                            existing[pos] = score
-
-            # Write heatmap every 3rd scoring cycle (~150 steps).
-            # The HTML auto-refreshes every 5s, no need to write every time.
-            self._heatmap_write_counter += 1
-            if self._heatmap_write_counter % 3 == 0:
-                self._write_heatmap()
+        if self._eviction_mgr is not None:
+            self._eviction_mgr.absorb_output(model_runner_output)
 
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
@@ -2287,61 +1885,6 @@ class Scheduler(SchedulerInterface):
 
         return [(r.request_id, r.client_index) for r in valid_requests]
 
-    def _write_heatmap(self) -> None:
-        """Write KV cache attention heatmap HTML file."""
-        if not self._block_importance_cache:
-            return
-
-        from vllm.v1.core.kv_cache_heatmap import write_heatmap
-
-        cfg = self.eviction_config
-        head_n = cfg.num_protected_head_blocks if cfg else 4
-        tail_n = cfg.num_protected_tail_blocks if cfg else 2
-
-        requests_data = []
-        for req_id, scores in self._block_importance_cache.items():
-            req = self.requests.get(req_id)
-            if req is None:
-                continue
-            all_blocks = self.kv_cache_manager.coordinator.get_blocks(
-                req_id
-            )
-            if not all_blocks:
-                continue
-            total = len(max(all_blocks, key=len))
-
-            evicted = set()
-            evicted_meta = self.kv_cache_manager.evicted_blocks.get(
-                req_id, []
-            )
-            for info in evicted_meta:
-                evicted.add(info.quest_stats.block_position)
-
-            # Extract token IDs per block for tooltip decoding.
-            block_token_ids: dict[int, list[int]] = {}
-            all_tids = req.all_token_ids
-            bs = self.block_size
-            for pos in range(total):
-                start = pos * bs
-                end = min(start + bs, len(all_tids))
-                if start < len(all_tids):
-                    block_token_ids[pos] = list(all_tids[start:end])
-
-            requests_data.append({
-                "req_id": req_id,
-                "total_blocks": total,
-                "num_computed_tokens": req.num_computed_tokens,
-                "scores": scores,
-                "num_protected_head": head_n,
-                "num_protected_tail": tail_n,
-                "evicted_positions": evicted,
-                "block_token_ids": block_token_ids,
-            })
-
-        if requests_data:
-            model_name = self.vllm_config.model_config.model
-            write_heatmap(requests_data, model_name=model_name)
-
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
@@ -2351,8 +1894,8 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
-        self._block_importance_cache.pop(request_id, None)
-        self._eviction_cooldown_req_ids.discard(request_id)
+        if self._eviction_mgr is not None:
+            self._eviction_mgr.on_request_finish(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 

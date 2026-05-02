@@ -198,14 +198,38 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
+    def attach_block_at_position(
+        self,
+        request_id: str,
+        kv_cache_group_idx: int,
+        position: int,
+        block: KVCacheBlock,
+    ) -> None:
+        """Re-attach a previously-evicted block at ``position`` in the
+        given KV cache group. See SingleTypeKVCacheManager for details.
+        """
+        if not 0 <= kv_cache_group_idx < len(self.single_type_managers):
+            raise IndexError(
+                f"attach_block_at_position: kv_cache_group_idx="
+                f"{kv_cache_group_idx} out of range "
+                f"[0, {len(self.single_type_managers)})"
+            )
+        self.single_type_managers[
+            kv_cache_group_idx
+        ].attach_block_at_position(request_id, position, block)
+
     def evict_blocks_at_positions(
-        self, request_id: str, positions: list[int]
+        self, request_id: str, positions: list[int],
+        free_immediately: bool = True,
     ) -> tuple[list[KVCacheBlock], ...]:
         """Evict blocks at specific positions across all KV cache groups.
 
         Args:
             request_id: The request ID.
             positions: Sorted list of position indices to evict.
+            free_immediately: If False, returned blocks remain allocated
+                (caller must free later). See single-type manager for
+                details — used by swap-out.
 
         Returns:
             Tuple of evicted block lists, one per KV cache group.
@@ -217,7 +241,8 @@ class KVCacheCoordinator(ABC):
             if valid_positions:
                 result.append(
                     manager.evict_blocks_at_positions(
-                        request_id, valid_positions))
+                        request_id, valid_positions,
+                        free_immediately=free_immediately))
             else:
                 result.append([])
         return tuple(result)

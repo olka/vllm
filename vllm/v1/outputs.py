@@ -204,6 +204,30 @@ class ModelRunnerOutput:
     # and sent back to the scheduler for cached use during eviction.
     block_importance_scores: dict[str, list[tuple[int, float]]] | None = None
 
+    # Swap-out completions: blocks the worker successfully placed in a
+    # tier (CPU L2 or NVMe L3) this step. Each tuple is (req_id,
+    # kv_cache_group_idx, block_position, file_path). The file_path is
+    # empty when the entry is L2-resident (not yet demoted to disk). The
+    # scheduler unpins the GPU block id (returns it to the pool) on
+    # receipt and records the entry in SwapStore for future swap-in.
+    swap_out_completed: list[tuple[str, int, int, str]] | None = None
+
+    # Swap-in completions: blocks the worker successfully restored from
+    # the swap tier into a fresh GPU block this step. Each tuple is
+    # (req_id, kv_cache_group_idx, block_position). The scheduler
+    # patches the request's block table at ``block_position`` to point
+    # at the freshly-filled GPU block.
+    swap_in_completed: list[tuple[str, int, int]] | None = None
+
+    # Swap-in failures: blocks the worker could not restore (bytes lost
+    # — for example a best-effort L2→L3 demotion that failed silently
+    # before swap-in was attempted). Each tuple is (req_id,
+    # kv_cache_group_idx, block_position). The scheduler frees the
+    # pre-allocated GPU block back to the pool, drops the SwapStore
+    # entry, and the next page-fault cycle falls through to rollback
+    # for these positions.
+    swap_in_failed: list[tuple[str, int, int]] | None = None
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

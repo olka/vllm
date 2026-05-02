@@ -17,6 +17,10 @@ from pathlib import Path
 _HEATMAP_PATH = Path(os.environ.get(
     "VLLM_KV_HEATMAP_PATH", "/tmp/vllm_kv_heatmap.html"
 ))
+_HEATMAP_KEEP_HISTORY = os.environ.get(
+    "VLLM_KV_HEATMAP_KEEP_HISTORY", "1"
+) not in ("0", "false", "False", "")
+_heatmap_seq = 0
 
 _HTML_TEMPLATE = """\
 <!doctype html>
@@ -414,3 +418,14 @@ def write_heatmap(
         _HEATMAP_PATH.write_text(page)
     except OSError:
         pass
+
+    if _HEATMAP_KEEP_HISTORY:
+        global _heatmap_seq
+        _heatmap_seq += 1
+        snapshot = _HEATMAP_PATH.with_name(
+            f"{_HEATMAP_PATH.stem}_{_heatmap_seq:05d}{_HEATMAP_PATH.suffix}"
+        )
+        try:
+            snapshot.write_text(page)
+        except OSError:
+            pass
