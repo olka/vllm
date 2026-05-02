@@ -200,7 +200,21 @@ class EngineCore:
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
-        if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
+        # Activate the block hasher when prefix caching is on, when a
+        # KV connector is configured, or when the cross-request swap
+        # reuse path needs deterministic per-block content hashes
+        # (paper §6.5: ``keep_swap_on_finish`` registers swap entries
+        # in a content-hash index that subsequent requests query).
+        kv_eviction_cfg = getattr(
+            vllm_config, "kv_cache_eviction_config", None
+        )
+        needs_hasher_for_swap_reuse = bool(
+            kv_eviction_cfg is not None
+            and getattr(kv_eviction_cfg, "keep_swap_on_finish", False)
+        )
+        if (vllm_config.cache_config.enable_prefix_caching
+                or kv_connector is not None
+                or needs_hasher_for_swap_reuse):
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo
             )

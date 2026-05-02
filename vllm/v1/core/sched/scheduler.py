@@ -255,6 +255,16 @@ class Scheduler(SchedulerInterface):
                 block_size=self.block_size,
                 model_name=self.vllm_config.model_config.model,
             )
+            # Paper §6.5: when a SwapTierConnector is configured, wire
+            # it to the SwapStore the eviction manager owns. This is
+            # what lets the connector's ``get_num_new_matched_tokens``
+            # query the cross-request hash index.
+            if self.connector is not None and hasattr(
+                self.connector, "bind_swap_store"
+            ):
+                self.connector.bind_swap_store(
+                    self._eviction_mgr.swap_store
+                )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER

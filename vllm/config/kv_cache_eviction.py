@@ -88,6 +88,29 @@ class KVCacheEvictionConfig:
     copies the block's KV bytes to ``swap_dir`` before the GPU block is
     returned to the pool, and recovery on miss reloads from disk."""
 
+    keep_swap_on_finish: bool = False
+    """Persist completed swap-out entries past request finish.
+
+    When False (default): on request finish, the SwapStore drops both
+    pending and completed entries for that request, and the on-disk
+    `.kv` files are unlinked asynchronously. Swap is scratch state
+    scoped to the request lifetime.
+
+    When True: pending allocations and pending swap-out/swap-in GPU
+    blocks are still freed (they belong to the finished request and
+    cannot be reused), but **completed** swap-out entries are preserved
+    in the SwapStore's content-hash index, and the on-disk files
+    survive the finish path. Subsequent requests that compute matching
+    block hashes hit the swap tier via `find_longest_cache_hit`'s
+    extension into SwapStore (paper §6.5.1) and recover the prior K/V
+    state at PCIe/NVMe bandwidth instead of re-prefilling.
+
+    Caveat: this flag is fully effective in L3-only mode
+    (``cpu_tier_capacity_bytes=0``). In L2 mode, only entries already
+    demoted from L2 to L3 persist; L2-resident entries are still dropped
+    on finish to avoid retaining pinned host buffers indefinitely.
+    Force-demote-on-finish for L2 retention is §8.6 follow-up work."""
+
     enable_proactive_recovery: bool = False
     """Enable the proactive page-fault handler that eagerly recovers
     evicted blocks (swap-in / rollback) every scheduler cycle while

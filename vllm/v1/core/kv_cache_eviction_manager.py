@@ -41,8 +41,17 @@ logger = init_logger(__name__)
 _EMA_ALPHA = 0.3
 # Heatmap is rewritten every Nth scoring cycle (HTML auto-refreshes every 5s).
 _HEATMAP_WRITE_EVERY = 2
-# Worker computes block importance every Nth step.
-_BI_REQUEST_EVERY = 50
+# Worker computes block importance every Nth step. Higher values
+# reduce scoring overhead at the cost of slower threshold adaptation,
+# but the bimodal split moves slowly: per §3.2, the cold population
+# drifts only ~3 orders of magnitude over ~8K tokens of decode, so a
+# threshold update every several seconds is sufficient. Decode-
+# generated blocks that haven't been scored yet are tail-protected,
+# so scoring lag on new blocks doesn't risk premature eviction. At
+# 500 the per-step scoring overhead is ~0.2% of decode cost; the
+# trade is throughput-favoring with negligible adaptation-quality
+# impact.
+_BI_REQUEST_EVERY = 500
 # Pre-warm fraction below the proactive threshold at which we start
 # requesting block importance from the worker.
 _BI_REQUEST_FILL_RATIO = 0.9
@@ -268,6 +277,8 @@ class KVCacheEvictionManager:
         Each entry is (req_id, kv_cache_group_idx, block_position,
         fresh_gpu_block_id) — the fresh block has been allocated by
         ``_try_swap_in`` and is awaiting the worker to populate it.
+        Used for in-request recovery (the page-fault path); cross-
+        request reuse goes through ``SwapTierConnector`` instead.
         """
         if not self._pending_swap_in_directives:
             return None
@@ -312,16 +323,129 @@ class KVCacheEvictionManager:
             self._maybe_write_heatmap()
 
     def on_request_finish(self, req_id: str) -> None:
-        """Drop per-request eviction state (called from finish path)."""
+        """Drop per-request eviction state (called from finish path).
+
+        When ``keep_swap_on_finish=True`` (paper §6.5), also dump all
+        currently-resident blocks of the request to swap *before*
+        cleaning up — without this, only the cold periphery that Otsu
+        happened to evict during the request would be persisted, and
+        the warm working set (sink + early prompt + reasoning anchors)
+        — exactly what subsequent same-prefix requests need to match —
+        would be lost when the GPU blocks are returned to the pool.
+        """
+        if (self._config.keep_swap_on_finish
+                and self._swap_store is not None):
+            self._dump_resident_blocks_at_finish(req_id)
         self._score_cache.pop(req_id, None)
         self._cooldown_req_ids.discard(req_id)
         self._tokens_at_last_eviction.pop(req_id, None)
         self._drop_swap_state(req_id)
 
+    def _dump_resident_blocks_at_finish(self, req_id: str) -> None:
+        """Issue swap-out directives for every resident, hashable block
+        of the finishing request. Bytes are persisted to disk; SwapStore
+        registers each by content hash for cross-request lookup.
+
+        Before the dump, we discard the cold-cache entries that Otsu
+        committed during the request — those are abandoned reasoning
+        and unlikely to match a future request. The persistent set
+        becomes "what mattered at finish" (the resident working set),
+        not "what was cold during decode".
+
+        The dump is fire-and-forget: directives are queued, the worker
+        writes asynchronously, and ``_absorb_swap_out_acks`` will absorb
+        the completions whenever they land — possibly after the request
+        has been fully torn down (the existing "request finished between
+        directive and ack" handling in ``_absorb_swap_out_acks`` covers
+        that case).
+        """
+        request = self._requests.get(req_id)
+        if request is None:
+            return
+        # Discard cold-cache entries from this request (Otsu evictions
+        # during decode). The resident working set, dumped below, is
+        # the hot cache — that's what we want to persist for paper
+        # §6.5 cross-request matching.
+        if self._swap_store is not None:
+            stale_paths = self._swap_store.drop_completed_only(req_id)
+            for path in stale_paths:
+                self._unlink_path_async(path)
+            if stale_paths:
+                logger.error(
+                    "finish-dump req=%s: ditched %d cold entries "
+                    "before resident dump",
+                    req_id, len(stale_paths),
+                )
+        all_blocks = self._kv_cache_manager.coordinator.get_blocks(req_id)
+        if not all_blocks:
+            return
+        # Single-group only — same constraint as Otsu's swap path.
+        blocks = max(all_blocks, key=len)
+        req_hashes = getattr(request, "block_hashes", None)
+        group_idx = 0
+        queued = 0
+        skipped_no_hash = 0
+        skipped_already_swapped = 0
+        skipped_null = 0
+        for pos, blk in enumerate(blocks):
+            if blk.is_null:
+                skipped_null += 1
+                continue
+            if (req_id, group_idx, pos) in self._pending_swap_blocks:
+                skipped_already_swapped += 1
+                continue
+            # Already-completed entries also live in SwapStore; skip
+            # those too (we don't want to re-issue a directive for
+            # bytes already on disk).
+            if self._swap_store is not None and (
+                self._swap_store.lookup(req_id, pos) is not None
+            ):
+                skipped_already_swapped += 1
+                continue
+            bare_hash = None
+            if req_hashes is not None and pos < len(req_hashes):
+                bare_hash = req_hashes[pos]
+            if bare_hash is None:
+                # Without a hash this entry isn't cross-request
+                # reusable — skip rather than dump bytes we can't
+                # later look up.
+                skipped_no_hash += 1
+                continue
+            self._swap_store.pin(
+                req_id, pos, group_idx, blk.block_id, bare_hash,
+            )
+            self._pending_swap_blocks[(req_id, group_idx, pos)] = blk
+            self._pending_swap_directives.append(
+                (req_id, group_idx, pos, blk.block_id)
+            )
+            queued += 1
+        # Mark these blocks as "evicted" from the manager's POV so the
+        # block_table doesn't try to free them through the normal path
+        # while the worker is still copying their bytes. The pin-and-
+        # async-ack pattern is identical to Otsu eviction.
+        if queued > 0:
+            self._kv_cache_manager.evict_blocks_at_positions(
+                req_id,
+                [pos for pos in range(len(blocks))
+                 if (req_id, group_idx, pos)
+                 in self._pending_swap_blocks
+                 and not blocks[pos].is_null],
+                free_immediately=False,
+            )
+        logger.error(
+            "finish-dump req=%s: queued=%d "
+            "skipped_already_swapped=%d skipped_null=%d "
+            "skipped_no_hash=%d",
+            req_id, queued, skipped_already_swapped,
+            skipped_null, skipped_no_hash,
+        )
+
     def _absorb_swap_out_acks(self, output: "ModelRunnerOutput") -> None:
         """Free pinned blocks for completed swap-outs, record paths."""
         if self._swap_store is None or not output.swap_out_completed:
             return
+        registered_hashes = 0
+        no_hash = 0
         for req_id, group_idx, block_pos, path in output.swap_out_completed:
             entry = self._swap_store.complete(req_id, block_pos, path)
             if entry is None:
@@ -331,11 +455,28 @@ class KVCacheEvictionManager:
                 # here as well in case the request is gone.
                 self._unlink_path_async(path)
                 continue
+            if entry.block_hash is not None:
+                registered_hashes += 1
+            else:
+                no_hash += 1
             block = self._pending_swap_blocks.pop(
                 (req_id, group_idx, block_pos), None
             )
             if block is not None:
                 self._kv_cache_manager.block_pool.free_blocks([block])
+        if registered_hashes or no_hash:
+            # Diagnostic for paper §6.5 cross-request reuse: the hash
+            # index can only be hit if hashes were captured at swap-out
+            # time. ``no_hash > 0`` means some entries are unreachable
+            # by ``lookup_by_hash`` — typically decode-generated blocks
+            # that hadn't filled by eviction time, OR a misconfiguration
+            # where ``request.block_hashes`` is empty (block_hasher not
+            # active).
+            logger.error(
+                "swap-out acks: %d entries registered by hash, "
+                "%d entries without hash (not cross-request reusable)",
+                registered_hashes, no_hash,
+            )
 
     def _absorb_swap_in_acks(self, output: "ModelRunnerOutput") -> None:
         """Patch block table for blocks the worker successfully restored.
@@ -430,9 +571,33 @@ class KVCacheEvictionManager:
         Pending swap-in blocks: freed (the fresh allocation is no
         longer needed; the worker's H2D copy, if it lands, will write
         into a block that nobody references).
-        Completed swap-out paths: unlinked asynchronously.
+        Completed swap-out paths:
+          - default: unlinked asynchronously, SwapStore drops the entry.
+          - ``keep_swap_on_finish=True``: preserved in SwapStore by
+            content-hash for cross-request reuse (paper §6.5).
         """
         if self._swap_store is None:
+            return
+        if self._config.keep_swap_on_finish:
+            # Preserve all swap-OUT entries (pending and completed).
+            # Pending: in-flight from finish-dump; will complete via
+            # the normal swap-out ack path. Their GPU blocks stay
+            # pinned in ``_pending_swap_blocks`` until the ack lands.
+            # Completed: needed for cross-request lookup by hash.
+            # However, pending swap-IN blocks are in-request recovery
+            # state — the request is gone, so the H2D destinations
+            # are no longer needed. Free them.
+            stale_swap_in: list["KVCacheBlock"] = []
+            for key in list(self._pending_swap_in_blocks.keys()):
+                if key[0] == req_id:
+                    stale_swap_in.append(
+                        self._pending_swap_in_blocks.pop(key)
+                    )
+            if stale_swap_in:
+                self._kv_cache_manager.block_pool.free_blocks(
+                    stale_swap_in
+                )
+            self._pending_swap_in_req_ids.discard(req_id)
             return
         pending, paths = self._swap_store.drop_request(req_id)
         # Free any pending swap-out blocks.
@@ -524,6 +689,23 @@ class KVCacheEvictionManager:
     @property
     def strategy_name(self) -> str:
         return self._strategy.name
+
+    @property
+    def swap_store(self) -> "SwapStore | None":
+        """Read-only access to the SwapStore — the content-hash-indexed
+        side table tracking pending and completed swap-outs.
+
+        Exposed so the ``SwapTierConnector`` (paper §6.5 cross-request
+        reuse) can call ``lookup_by_hash`` from the scheduler-side
+        ``get_num_new_matched_tokens`` path. The connector and the
+        eviction manager are both scheduler-side singletons; the engine
+        wires them together by calling ``connector.bind_swap_store(
+        eviction_manager.swap_store)`` at init time.
+
+        Returns None when ``config.enable_swap`` is False — in which
+        case there is nothing to share.
+        """
+        return self._swap_store
 
     # ─────────────────────────────────────────────────────────────────
     # Private — moved verbatim from Scheduler.
@@ -941,8 +1123,27 @@ class KVCacheEvictionManager:
             )
             group_idx = 0
             req_id = request.request_id
+            # Source the bare (non-group-qualified) chained block hash
+            # for cross-request reuse (paper §6.5). Two sources:
+            #   1. ``request.block_hashes[pos]`` — populated by the
+            #      block_hasher when configured (broadened in
+            #      engine/core.py to activate on keep_swap_on_finish).
+            #      Available regardless of ``enable_prefix_caching``.
+            #   2. ``blk.block_hash`` — populated by ``cache_full_blocks``,
+            #      which only runs when prefix caching is enabled.
+            # Prefer (1): it's the only source that works under the
+            # paper's v1 assumption ``--enable-prefix-caching=false``.
+            req_hashes = getattr(request, "block_hashes", None)
             for pos, blk in to_evict:
-                self._swap_store.pin(req_id, pos, group_idx, blk.block_id)
+                bare_hash = None
+                if req_hashes is not None and pos < len(req_hashes):
+                    bare_hash = req_hashes[pos]
+                elif blk.block_hash is not None:
+                    from vllm.v1.core.kv_cache_utils import get_block_hash
+                    bare_hash = get_block_hash(blk.block_hash)
+                self._swap_store.pin(
+                    req_id, pos, group_idx, blk.block_id, bare_hash,
+                )
                 self._pending_swap_blocks[(req_id, group_idx, pos)] = blk
                 self._pending_swap_directives.append(
                     (req_id, group_idx, pos, blk.block_id)
@@ -1040,7 +1241,11 @@ class KVCacheEvictionManager:
             })
 
         if requests_data:
-            write_heatmap(requests_data, model_name=self._model_name)
+            write_heatmap(
+                requests_data,
+                model_name=self._model_name,
+                dead_threshold=self._dead_threshold,
+            )
 
 
 def _safe_unlink(path: str) -> None:
