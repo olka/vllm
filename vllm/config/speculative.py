@@ -54,9 +54,10 @@ MTPModelTypes = Literal[
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
-# DSpark = DFlash-style parallel block backbone + a low-rank Markov sequential head +
-# a confidence head (arXiv 2606.19348). It shares DFlash's aux-hidden-state plumbing, so
-# it is grouped with the Eagle/DFlash family that passes target hidden states to the draft.
+# DSpark = DFlash-style parallel block backbone + a low-rank Markov sequential
+# head + a confidence head (arXiv 2606.19348). It shares DFlash's aux-hidden-state
+# plumbing, so it is grouped with the Eagle/DFlash family that passes target
+# hidden states to the draft.
 DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
     "eagle",
@@ -160,6 +161,11 @@ class SpeculativeConfig:
     in parallel rather than sequentially. This can improve performance but
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
+    dspark_enable_confidence_head: bool = False
+    """DSpark method only: enable the confidence head + hardware-aware prefix
+    scheduler (paper §3.2). Off by default. It emits variable-length (ragged)
+    drafts, so it is incompatible with CUDA graphs and async scheduling — run
+    with ``enforce_eager=True`` and without async scheduling."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -330,12 +336,14 @@ class SpeculativeConfig:
                 {"n_predict": n_predict, "architectures": ["DeepSeekMTPModel"]}
             )
         if hf_config.model_type == "deepseek_v4":
+            # Both the DSpark drafter and the plain V4 MTP layer route through the
+            # deepseek_mtp draft path.
+            hf_config.model_type = "deepseek_mtp"
             # A V4 checkpoint with `dspark_block_size` carries the DSpark drafter
             # (parallel backbone + Markov + confidence heads) rather than the plain
             # MTP layer; route it to the DSpark draft architecture and surface the
             # dspark_config the proposer reads.
             if getattr(hf_config, "dspark_block_size", None) is not None:
-                hf_config.model_type = "deepseek_mtp"
                 hf_config.update(
                     {
                         "architectures": ["DeepSeekV4DSparkModel"],
@@ -346,20 +354,19 @@ class SpeculativeConfig:
                         ),
                         "dspark_config": {
                             "block_size": hf_config.dspark_block_size,
-                            "markov_rank": getattr(hf_config, "dspark_markov_rank", 256),
+                            "markov_rank": getattr(
+                                hf_config, "dspark_markov_rank", 256
+                            ),
                             "target_layer_ids": getattr(
                                 hf_config, "dspark_target_layer_ids", []
                             ),
                             "noise_token_id": getattr(
                                 hf_config, "dspark_noise_token_id", None
                             ),
-                            "enable_confidence_head": True,
-                            "confidence_threshold": 0.5,
                         },
                     }
                 )
             else:
-                hf_config.model_type = "deepseek_mtp"
                 n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
                 hf_config.update(
                     {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}

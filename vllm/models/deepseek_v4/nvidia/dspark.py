@@ -13,30 +13,30 @@ own ``inference/model.py`` reference (``DSparkBlock`` / ``forward_spec``):
   * ``mtp.2`` (head stage): block + ``norm`` + ``hc_head_{fn,base,scale}`` +
     ``markov_head`` (Eq. 5) + ``confidence_head`` (Eq. 7).
 
-The draft owns no ``embed_tokens`` / LM head: both are shared from the target model
-(MTP path in ``llm_base_proposer._maybe_share_*``). The Markov left-to-right block
-sampling + confidence truncation live in the proposer (``vllm/v1/spec_decode/dspark.py``).
+The draft owns no ``embed_tokens`` / LM head: both are shared from the target
+model (MTP path in ``llm_base_proposer._maybe_share_*``). The Markov
+left-to-right block sampling + confidence scheduling live in the proposer
+(``vllm/v1/spec_decode/dspark.py``).
 
-The DSpark *forward* (``forward_spec``) is a cross-attention pass — the noise-token block
-is the query stream and ``main_x`` is the KV context (custom ``DSparkAttention`` in the
-reference) — and is implemented in :meth:`DeepSeekV4DSparkModel.forward`. The attention
-compute itself (Gap C) is being ported faithfully from the reference; see the
-``NotImplementedError`` below for the exact algorithm.
+The DSpark *forward* (``forward_spec``) is a cross-attention pass — the
+noise-token block is the query stream and ``main_x`` is the KV context (custom
+``DSparkAttention`` in the reference) — implemented in
+:meth:`DeepSeekV4DSparkModel.forward`.
 """
 
+import re
 import typing
 from collections.abc import Callable, Iterable
 
-import regex as re
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
-from vllm.forward_context import set_forward_context
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
@@ -186,7 +186,8 @@ class DeepSeekV4DSparkLayer(nn.Module):
 
 
 class DeepSeekV4DSparkModel(nn.Module):
-    """Stacked DSpark draft (one stage per target layer) sharing the target embedding."""
+    """Stacked DSpark draft (one stage per target layer); shares the target
+    embedding."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -250,9 +251,9 @@ class DeepSeekV4DSparkModel(nn.Module):
         residual (``[num_tokens, hc_mult * hidden]``); ``compute_logits`` applies
         hc_head + norm + the shared LM head.
 
-        Iteration 1 (runnable-lossless): the block self-attends through the SWA
-        backend; the faithful ``main_x`` context cross-attention (precompute path)
-        is layered in next, which is what lifts the acceptance rate.
+        The block attends through the (non-causal) SWA backend over a window that
+        includes the fused target context (``main_x``, inserted as KV); the Markov
+        sequential dependency is applied per-position in the proposer.
         """
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -352,7 +353,8 @@ class DeepSeekV4DSpark(nn.Module):
             main_x = first.fuse_target_hidden(context_states)
         else:
             main_x = context_states
-        # deep_gemm requires a contiguous fp8 input; main_x is a buffer slice / norm view.
+        # deep_gemm requires a contiguous fp8 input; main_x is a buffer slice /
+        # norm view.
         main_x = main_x.contiguous()
 
         for idx in range(
@@ -412,7 +414,7 @@ class DeepSeekV4DSpark(nn.Module):
                 )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        """Base block logits ``U_k`` (Markov bias is added per-position in the proposer).
+        """Base block logits ``U_k`` (Markov bias added per-position in the proposer).
 
         Uses the head stage's hc_head + final norm, then the shared target LM head.
         """

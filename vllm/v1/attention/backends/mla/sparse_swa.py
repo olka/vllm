@@ -314,14 +314,20 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             if self.vllm_config.speculative_config
             else 0
         )
-        # With MTP, decode can have query_len up to 1 + num_speculative_tokens.
-        # Must match the threshold used by the indexer and flashmla_sparse so
-        # that all backends agree on the decode/prefill split.
-        self.decode_threshold = (
-            self.reorder_batch_threshold + self.num_speculative_tokens
-        )
-
+        # With MTP, decode query_len is up to 1 + num_speculative_tokens. DSpark's
+        # parallel draft instead processes a fixed block of dspark_block_size
+        # query rows per request (decoupled from num_speculative_tokens), so the
+        # whole block must be treated as decode — otherwise it is misrouted to the
+        # sparse-prefill path and crashes at high batch (indices shape mismatch).
+        # For MTP (no dspark_block_size) this is a no-op. Must match the threshold
+        # used by the indexer and flashmla_sparse so all backends agree.
         hf_config = self.vllm_config.model_config.hf_config
+        dspark_block = getattr(hf_config, "dspark_block_size", None)
+        spec_query_len = self.num_speculative_tokens
+        if dspark_block is not None:
+            spec_query_len = max(spec_query_len, dspark_block - 1)
+        self.decode_threshold = self.reorder_batch_threshold + spec_query_len
+
         assert hasattr(hf_config, "sliding_window")
         self.window_size = hf_config.sliding_window
 

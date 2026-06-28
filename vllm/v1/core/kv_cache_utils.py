@@ -1574,9 +1574,11 @@ def _get_draft_layer_names(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> set[str]:
     """Names of attention layers added by a spec-decode draft model (layer index
-    >= the target's num_hidden_layers). Empty unless an eagle-style draft is used."""
+    >= the target's num_hidden_layers). Empty unless the DSpark drafter is used —
+    only its multi-layer SWA draft needs the dedicated single-group layout; other
+    drafters (eagle/mtp/dflash) keep the default grouping unchanged."""
     spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_eagle():
+    if spec_config is None or spec_config.method != "dspark":
         return set()
     num_target_layers = vllm_config.model_config.hf_config.num_hidden_layers
     draft: set[str] = set()
@@ -1680,7 +1682,11 @@ def _get_kv_cache_groups_uniform_groups(
         if draft_in_spec:
             draft_specs = {n: sm_spec.kv_cache_specs[n] for n in draft_in_spec}
             draft_uniform = UniformTypeKVCacheSpecs.from_specs(draft_specs)
-            assert draft_uniform is not None
+            if draft_uniform is None:
+                raise ValueError(
+                    "DSpark draft layers are not uniformly groupable: "
+                    f"{sorted(draft_in_spec)}"
+                )
             swa_mla_groups.append(
                 KVCacheGroupSpec(
                     layer_names=draft_in_spec, kv_cache_spec=draft_uniform
@@ -1692,6 +1698,14 @@ def _get_kv_cache_groups_uniform_groups(
             }
             if not any(layers_per_size.values()):
                 continue
+            # Removing the draft layers must leave each page-size bucket with an
+            # equal layer count; otherwise the tuple zip() below silently drops
+            # layers. (Holds for the uniform V4 draft stages; guard future configs.)
+            if len({len(v) for v in layers_per_size.values()}) > 1:
+                raise ValueError(
+                    "DSpark draft-layer removal unbalanced the KV page-size "
+                    "buckets; cannot form aligned groups."
+                )
 
         num_layers_per_size = len(next(iter(layers_per_size.values())))
 

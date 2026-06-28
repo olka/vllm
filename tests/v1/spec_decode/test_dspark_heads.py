@@ -14,6 +14,7 @@ from vllm.model_executor.models.deepseek_dspark_heads import (
     MarkovHead,
     markov_block_sample,
 )
+from vllm.v1.spec_decode.dspark import fit_linear_cost, schedule_prefixes
 
 VOCAB, HIDDEN, RANK, GAMMA = 64, 32, 8, 5  # small stand-ins for fast CPU tests
 
@@ -64,7 +65,8 @@ class TestConfidenceHead:
 
 class TestMarkovBlockSample:
     def test_sequential_dependency_and_adjusted_logits(self):
-        """Position k's adjusted logit must be U_k + B(x_{k-1}); greedy picks its argmax."""
+        """Adjusted logit at position k must be U_k + B(x_{k-1}); greedy picks
+        its argmax."""
         m = _markov()
         base = torch.randn(GAMMA, VOCAB)
         anchor = torch.tensor(11)
@@ -101,9 +103,6 @@ class TestMarkovBlockSample:
 # ---------------------------------------------------------------------------
 # Hardware-aware prefix scheduler: cost-model fit + greedy budget allocation.
 # ---------------------------------------------------------------------------
-from vllm.v1.spec_decode.dspark import fit_linear_cost, schedule_prefixes
-
-
 def test_fit_linear_cost_recovers_slope():
     # synthetic step-time T(B) = 0.1 + 0.002 * B
     samples = [(float(b), 0.1 + 0.002 * b) for b in range(10, 110, 10)]
@@ -138,16 +137,50 @@ def test_schedule_prefixes_compute_bound_prunes():
     # large per-token cost -> each extra verify token is expensive -> prune
     keep = schedule_prefixes(surv, cost_a=1.0, cost_b=10.0)
     assert int(keep.max()) < GAMMA
-    assert int(keep.min()) >= 0
+    assert int(keep.min()) >= 1  # every request drafts at least one token
 
 
 def test_schedule_prefixes_confidence_ordered_and_valid():
-    surv = torch.tensor([
-        [0.95, 0.90, 0.85, 0.80, 0.75],  # high-confidence request
-        [0.40, 0.16, 0.06, 0.02, 0.01],  # low-confidence request
-    ])
+    surv = torch.tensor(
+        [
+            [0.95, 0.90, 0.85, 0.80, 0.75],  # high-confidence request
+            [0.40, 0.16, 0.06, 0.02, 0.01],  # low-confidence request
+        ]
+    )
     keep = schedule_prefixes(surv, cost_a=1.0, cost_b=0.5)
     assert keep.shape == (2,)
-    assert (keep >= 0).all() and (keep <= GAMMA).all()
+    assert (keep >= 1).all() and (keep <= GAMMA).all()
     # budget flows to the higher-survival request first
     assert int(keep[0]) >= int(keep[1])
+
+
+def test_schedule_prefixes_batch_one():
+    surv = torch.tensor([[0.9, 0.7, 0.5, 0.3, 0.1]])  # R=1
+    keep = schedule_prefixes(surv, cost_a=1.0, cost_b=0.5)
+    assert keep.shape == (1,)
+    assert 1 <= int(keep[0]) <= GAMMA
+
+
+def test_schedule_prefixes_all_one_survival_keeps_full():
+    # every position certain to survive + ~free verification -> keep the block
+    surv = torch.ones(3, GAMMA)
+    keep = schedule_prefixes(surv, cost_a=1.0, cost_b=1e-6)
+    assert torch.equal(keep, torch.full((3,), GAMMA, dtype=torch.int32))
+
+
+def test_schedule_prefixes_all_zero_survival_keeps_min_one():
+    # nothing survives, but every request must still draft >=1 token: an empty
+    # (zero-length) draft yields ragged shapes that crash the verify path at high
+    # concurrency, so the scheduler floors keep at 1.
+    surv = torch.zeros(3, GAMMA)
+    keep = schedule_prefixes(surv, cost_a=1.0, cost_b=5.0)
+    assert torch.equal(keep, torch.ones(3, dtype=torch.int32))
+
+
+def test_schedule_prefixes_kstar_zero_under_huge_cost():
+    # huge per-token cost -> optimum verifies no draft tokens (kstar=0), but the
+    # keep>=1 floor still drafts one token per request (empty drafts crash the
+    # verify path), so every request keeps exactly 1.
+    surv = (0.6 * torch.ones(4, GAMMA)).cumprod(dim=1)
+    keep = schedule_prefixes(surv, cost_a=0.001, cost_b=1000.0)
+    assert torch.equal(keep, torch.ones(4, dtype=torch.int32))

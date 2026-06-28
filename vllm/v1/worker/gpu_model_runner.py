@@ -178,8 +178,8 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
-from vllm.v1.spec_decode.dspark import DSparkProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.dspark import DSparkProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
@@ -594,8 +594,9 @@ class GPUModelRunner(
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.method == "dspark":
-                # DSpark = DFlash parallel backbone + Markov + confidence heads; reuses
-                # DFlash's aux-hidden-state plumbing (parallel block, KV/hidden injection).
+                # DSpark = DFlash parallel backbone + Markov + confidence heads;
+                # reuses DFlash's aux-hidden-state plumbing (parallel block,
+                # KV/hidden injection).
                 # Aux hidden states (target layers [40,41,42] -> main_x) require the
                 # target to implement the EAGLE3 interface; gated by the proposer flag.
                 self.drafter = DSparkProposer(self.vllm_config, self.device, self)

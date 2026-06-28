@@ -26,10 +26,10 @@ class MarkovHead(nn.Module):
     """Low-rank first-order transition bias ``B(x) = W1[x] @ W2.T`` (paper Eq. 5).
 
     The full ``vocab x vocab`` transition matrix is factorized at ``rank`` (256 by
-    default): ``markov_w1`` is an embedding lookup of the previously sampled token into
-    rank space, ``markov_w2`` projects rank space back to vocab logits. The bias is added
-    to the backbone's base logit before sampling each block position, which is what
-    breaks the parallel drafter's mode-collision / suffix decay.
+    default): ``markov_w1`` is an embedding lookup of the previously sampled token
+    into rank space, ``markov_w2`` projects rank space back to vocab logits. The
+    bias is added to the backbone's base logit before sampling each block position,
+    which is what breaks the parallel drafter's mode-collision / suffix decay.
     """
 
     def __init__(self, vocab_size: int, hidden_size: int, rank: int) -> None:
@@ -46,7 +46,7 @@ class MarkovHead(nn.Module):
         return self.markov_w1[prev_token_ids]
 
     def bias_from_embedding(self, w1_x: torch.Tensor) -> torch.Tensor:
-        """Project a rank-space vector to a full vocab bias: ``w1_x @ W2.T`` -> [..., V]."""
+        """Rank-space vector -> full vocab bias: ``w1_x @ W2.T`` -> [..., V]."""
         return torch.matmul(w1_x, self.markov_w2.t())
 
     def bias(self, prev_token_ids: torch.Tensor) -> torch.Tensor:
@@ -58,9 +58,10 @@ class ConfidenceHead(nn.Module):
     """Per-position acceptance estimate ``c_k = sigmoid(w . [h_k ; W1[x_{k-1}]])``.
 
     Predicts the *conditional* probability that draft token ``k`` survives target
-    verification given all earlier block tokens were accepted (paper Eq. 7). The input is
-    the backbone hidden state concatenated with the Markov embedding of the previous
-    token; the projection is bias-free and outputs a single logit per position.
+    verification given all earlier block tokens were accepted (paper Eq. 7). The
+    input is the backbone hidden state concatenated with the Markov embedding of
+    the previous token; the projection is bias-free and outputs one logit per
+    position.
     """
 
     def __init__(self, hidden_size: int, rank: int) -> None:
@@ -68,7 +69,7 @@ class ConfidenceHead(nn.Module):
         self.proj = nn.Linear(hidden_size + rank, 1, bias=False)
 
     def logits(self, hidden: torch.Tensor, w1_prev: torch.Tensor) -> torch.Tensor:
-        """Confidence logits -> [...]; sigmoid gives per-position survival probability."""
+        """Confidence logits -> [...]; sigmoid gives per-position survival prob."""
         return self.proj(torch.cat([hidden, w1_prev], dim=-1)).squeeze(-1)
 
 
@@ -81,15 +82,16 @@ def markov_block_sample(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Left-to-right block sampling with the Markov bias (paper Eq. 4-5).
 
-    The backbone is run once to produce ``base_logits`` ``U_1..U_gamma`` for the whole
-    block; here we walk the block sequentially, adding ``B(x_{k-1})`` before sampling
-    position ``k``. This loop touches only logits (no transformer re-run), so it stays in
-    the ``T_sequential << T_parallel`` regime. It is a fixed-length, CUDA-graph-friendly
-    unroll.
+    The backbone is run once to produce ``base_logits`` ``U_1..U_gamma`` for the
+    whole block; here we walk the block sequentially, adding ``B(x_{k-1})`` before
+    sampling position ``k``. This loop touches only logits (no transformer re-run),
+    so it stays in the ``T_sequential << T_parallel`` regime — a fixed-length,
+    CUDA-graph-friendly unroll.
 
     Args:
         base_logits:   [gamma, vocab] backbone base logits for one request.
-        anchor_token_id: scalar — the bonus/anchor token ``x_0`` from the previous round.
+        anchor_token_id: scalar — the bonus/anchor token ``x_0`` from the previous
+            round.
         markov:        the Markov head.
         greedy:        argmax (used for verification-exact draft probs) vs multinomial.
 

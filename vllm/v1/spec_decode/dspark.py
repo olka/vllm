@@ -8,15 +8,15 @@ mask-token-block machinery (cross-attention input layout, the fused input Triton
 kernel, CUDA-graph-stable buffers, ``dummy_run``) and override only the
 *sampling tail*:
 
-  1. one parallel backbone pass -> base logits ``U_1..U_gamma`` + hiddens ``h_1..h_gamma``;
-  2. a left-to-right **Markov loop** that adds ``B(x_{k-1}) = W1[x_{k-1}] @ W2.T`` before
-     sampling each position (injects the intra-block dependency a pure parallel drafter
-     lacks). This touches only logits — no transformer re-run — so it stays in the
-     ``T_sequential << T_parallel`` regime, and is a fixed-length (``gamma``) unroll that
-     is CUDA-graph-capturable;
-  3. **confidence-head truncation**: keep the longest prefix whose cumulative survival
-     probability stays above ``confidence_threshold`` (static-threshold variant; the
-     paper's hardware-aware scheduler is out of scope).
+  1. one parallel backbone pass -> base logits ``U_1..U_gamma`` + hiddens
+     ``h_1..h_gamma``;
+  2. a left-to-right **Markov loop** adding ``B(x_{k-1}) = W1[x_{k-1}] @ W2.T``
+     before sampling each position (injects the intra-block dependency a pure
+     parallel drafter lacks). This touches only logits — no transformer re-run —
+     a fixed-length (``gamma``) unroll that stays CUDA-graph-capturable;
+  3. an optional **confidence head + hardware-aware prefix scheduler** (§3.2.2):
+     the confidence head scores per-position prefix survival and the scheduler
+     allocates the per-batch verify budget to maximize accepted-tokens/step-time.
 
 The Markov-*adjusted* logits — not the base logits — are returned as the draft
 distribution so that rejection-sampling verification stays exact (lossless).
@@ -86,7 +86,9 @@ def schedule_prefixes(
         keep.scatter_add_(
             0, req, torch.ones(kstar, dtype=torch.int32, device=surv.device)
         )
-    return keep
+    # Every request must draft at least one token: a zero-length (empty) draft
+    # yields ragged/empty shapes that crash the verify path at high concurrency.
+    return keep.clamp_(min=1)
 
 
 class DSparkProposer(DFlashProposer):
@@ -121,7 +123,14 @@ class DSparkProposer(DFlashProposer):
         # tokens per step-time. Off by default; the scheduler only prunes when the
         # online-calibrated cost model shows verification is compute-bound, so it
         # preserves the full block (and the latency win) at small batch.
-        self.enable_confidence = cfg.get("enable_confidence_head", False)
+        self.enable_confidence = (
+            vllm_config.speculative_config.dspark_enable_confidence_head
+        )
+        if self.enable_confidence and vllm_config.scheduler_config.async_scheduling:
+            raise ValueError(
+                "DSpark confidence head emits ragged (variable-length) drafts, "
+                "which are incompatible with async scheduling; disable one."
+            )
         # Online-calibrated verify cost model T(B) = cost_a + cost_b * B, fit from
         # observed (verify_budget, step_time) samples. None until enough variation.
         self._cost_a: float | None = None
@@ -223,20 +232,28 @@ class DSparkProposer(DFlashProposer):
         prefix scheduler to emit a ragged (per-request length) draft.
         """
         # next_token_ids is the 5th positional arg of the base propose().
-        self._anchor_token_ids = (
-            args[4] if len(args) > 4 else kwargs["next_token_ids"]
-        )
+        self._anchor_token_ids = args[4] if len(args) > 4 else kwargs["next_token_ids"]
         now = time.perf_counter()
         if self._last_step_time is not None and self._last_budget is not None:
             self._record_cost(self._last_budget, now - self._last_step_time)
         self._last_step_time = now
 
+        # Reset before the pass so a stale survival tensor cannot be reused if the
+        # base proposer early-returns without sampling (empty batch / K=0 dynamic SD).
+        self._last_surv = None
+        self._last_budget = None
         draft = super().propose(*args, **kwargs)  # [num_reqs, gamma] tensor
-        if not self.enable_confidence or self._last_surv is None:
-            self._last_budget = None
+        surv = self._last_surv
+        # Bail to the full-block tensor draft unless confidence is on and the
+        # survival tensor lines up with this pass's requests.
+        if (
+            not self.enable_confidence
+            or surv is None
+            or surv.shape[0] != draft.shape[0]
+        ):
             return draft
-        keep = self._schedule_keep(self._last_surv)
-        self._last_budget = float(self._last_surv.shape[0] + int(keep.sum()))
+        keep = self._schedule_keep(surv)
+        self._last_budget = float(surv.shape[0] + int(keep.sum()))
         # Ragged draft -> runner's variable-length path (like ngram): the engine
         # verifies only `keep` tokens per request, so the drafted denominator drops.
         return [row[:k] for row, k in zip(draft.tolist(), keep.tolist())]
@@ -251,8 +268,8 @@ class DSparkProposer(DFlashProposer):
 
         ``hidden_states`` holds the gamma sample positions per request (request-major,
         ``[batch*gamma, *]``). We compute the base logits ``U_k``, then add the Markov
-        bias ``B(x_{k-1})`` left-to-right (Eq. 4-5). Greedy sampling -> draft_probs=None,
-        which gives exact (lossless) rejection-sampling acceptance.
+        bias ``B(x_{k-1})`` left-to-right (Eq. 4-5). Greedy -> draft_probs=None,
+        giving exact (lossless) rejection-sampling acceptance.
         """
         gamma = self.num_speculative_tokens
         if self.enable_confidence:
