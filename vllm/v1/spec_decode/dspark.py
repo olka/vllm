@@ -91,6 +91,36 @@ def schedule_prefixes(
     return keep.clamp_(min=1)
 
 
+def schedule_uniform_length(
+    surv: torch.Tensor, cost_a: float | None, cost_b: float | None
+) -> int:
+    """CUDA-graph-native verify scheduler: pick ONE per-step length L in [1, gamma].
+
+    Unlike :func:`schedule_prefixes` (per-request *ragged* keep, which forces the
+    eager list path), this returns a single batch-uniform verify length L. Every
+    request then verifies ``1 + L`` tokens, so the total query length stays
+    ``num_reqs * (1 + L)`` -- a fixed, bucketable ``num_tokens`` the PIECEWISE
+    CUDA-graph dispatcher already captures. L simply selects which graph is
+    replayed; smaller L -> smaller captured graph -> realized compute saving.
+    (See DSPARK_CUDAGRAPH_SCHEDULER_DESIGN.md.)
+
+    Objective is the paper's (accepted-tokens / step-time): with uniform L the
+    expected accepted tokens are ``R + sum_r surv[r, :L]`` and step-time is
+    ``cost_a + cost_b * R*(1+L)``. Falls back to the full block (``gamma``) when
+    the cost model is uncalibrated (``cost_b`` falsy).
+    """
+    R, gamma = surv.shape
+    if not cost_b:
+        return gamma
+    # Expected accepted *draft* tokens at each uniform prefix length L = 0..gamma.
+    accept = surv.new_zeros(gamma + 1, dtype=torch.float64)
+    accept[1:] = surv.double().sum(dim=0).cumsum(0)  # sum_r surv[r, :L]
+    lengths = torch.arange(gamma + 1, device=surv.device, dtype=torch.float64)
+    budget = R * (1.0 + lengths)  # total verify tokens at uniform length L
+    throughput = (R + accept) / (cost_a + cost_b * budget)
+    return max(1, int(throughput.argmax()))
+
+
 class DSparkProposer(DFlashProposer):
     def __init__(
         self,
@@ -252,11 +282,22 @@ class DSparkProposer(DFlashProposer):
             or surv.shape[0] != draft.shape[0]
         ):
             return draft
-        keep = self._schedule_keep(surv)
-        self._last_budget = float(surv.shape[0] + int(keep.sum()))
-        # Ragged draft -> runner's variable-length path (like ngram): the engine
-        # verifies only `keep` tokens per request, so the drafted denominator drops.
-        return [row[:k] for row, k in zip(draft.tolist(), keep.tolist())]
+        # CUDA-graph-native scheduler: choose a single per-step uniform verify
+        # length L in [1, gamma]. The verify shape stays num_reqs*(1+L) -- a
+        # bucketable num_tokens the PIECEWISE dispatcher already captures -- so L
+        # just selects which graph is replayed. (The ragged per-request keep below
+        # is kept for reference/v2 but forces the eager list path.)
+        length = schedule_uniform_length(surv, self._cost_a, self._cost_b)
+        # TEMP validation hook: DSPARK_FORCE_L pins L to test the L<gamma cudagraph
+        # path deterministically. Remove after the pack/bucket approach is validated.
+        import os
+
+        _force = os.environ.get("DSPARK_FORCE_L")
+        if _force:
+            length = max(1, min(int(_force), draft.shape[1]))
+        self._last_budget = float(surv.shape[0] * (1 + length))
+        # Uniform tensor draft -> stays on the runner's CUDA-graph tensor path.
+        return draft[:, :length].contiguous()
 
     @override
     def _sample_draft_tokens(
