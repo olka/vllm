@@ -28,7 +28,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
         runner=None,
     ):
         assert vllm_config.speculative_config is not None
-        assert vllm_config.speculative_config.method == "dflash"
+        # DSpark (arXiv 2606.19348) reuses the DFlash parallel-drafting backbone.
+        assert vllm_config.speculative_config.method in ("dflash", "dspark")
         super().__init__(
             vllm_config=vllm_config,
             device=device,
@@ -160,6 +161,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             total_input_tokens=num_context,
             BLOCK_SIZE=BLOCK_SIZE,
             HAS_NUM_REJECTED=has_num_rejected,
+            SAMPLE_FROM_BONUS=getattr(self, "_sample_from_bonus", False),
         )
 
         query_slot_mapping = self._slot_mapping_buffer[:num_query_total]

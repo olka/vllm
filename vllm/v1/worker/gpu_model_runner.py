@@ -178,6 +178,7 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
+from vllm.v1.spec_decode.dspark import DSparkProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -592,6 +593,15 @@ class GPUModelRunner(
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.method == "dspark":
+                # DSpark = DFlash parallel backbone + Markov + confidence heads; reuses
+                # DFlash's aux-hidden-state plumbing (parallel block, KV/hidden injection).
+                # Aux hidden states (target layers [40,41,42] -> main_x) require the
+                # target to implement the EAGLE3 interface; gated by the proposer flag.
+                self.drafter = DSparkProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = (
+                    self.drafter.eagle3_use_aux_hidden_state
+                )
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -5742,9 +5752,19 @@ class GPUModelRunner(
         max_num_reqs = self.scheduler_config.max_num_seqs
         if create_mixed_batch:
             assert not uniform_decode
-            # Create mixed batch:
-            # first half decode tokens, second half one prefill
-            num_decode_tokens = min(max_num_reqs - 1, num_tokens // 2)
+            # Create mixed batch: decode requests + one prefill. Spec-decode parallel
+            # drafting raises the attention reorder threshold, so size the prefill
+            # request above it — otherwise it is reclassified as decode and the C128A
+            # prefill-indexer path (DeepSeek-V4 sparse MLA) is never exercised/warmed.
+            reorder_threshold = 1
+            spec = self.speculative_config
+            if spec is not None and spec.num_speculative_tokens is not None:
+                reorder_threshold = 1 + (
+                    2 if spec.parallel_drafting else 1
+                ) * spec.num_speculative_tokens
+            num_decode_tokens = min(
+                max_num_reqs - 1, max(0, num_tokens - (reorder_threshold + 1))
+            )
             num_prefill_tokens = num_tokens - num_decode_tokens
             num_reqs = num_decode_tokens + 1
 

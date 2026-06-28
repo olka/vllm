@@ -6,6 +6,7 @@ import copy
 import hashlib
 import math
 import os
+import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -1569,12 +1570,35 @@ def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -
     return best_d
 
 
+def _get_draft_layer_names(
+    vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
+) -> set[str]:
+    """Names of attention layers added by a spec-decode draft model (layer index
+    >= the target's num_hidden_layers). Empty unless an eagle-style draft is used."""
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or not spec_config.use_eagle():
+        return set()
+    num_target_layers = vllm_config.model_config.hf_config.num_hidden_layers
+    draft: set[str] = set()
+    for name in kv_cache_spec:
+        m = re.search(r"layers\.(\d+)\.", name)
+        if m is not None and int(m.group(1)) >= num_target_layers:
+            draft.add(name)
+    return draft
+
+
 def _get_kv_cache_groups_uniform_groups(
     grouped_specs: list[UniformTypeKVCacheSpecs],
+    draft_layer_names: set[str] | None = None,
 ) -> list[KVCacheGroupSpec]:
     """
     Generate the KV cache groups from the grouped specs.
+
+    ``draft_layer_names`` (spec-decode multi-layer drafts) are kept together in a
+    single group instead of being round-robin-split for full-MLA tuple alignment, so
+    the proposer's single-AttentionMetadata requirement holds.
     """
+    draft_layer_names = draft_layer_names or set()
     assert len(grouped_specs) > 0 and all(
         isinstance(spec, UniformTypeKVCacheSpecs) for spec in grouped_specs
     )
@@ -1643,6 +1667,32 @@ def _get_kv_cache_groups_uniform_groups(
         # have the same number of layers. This also means we don't need to pad layers
         # inside a partial-full layer tuple.
         assert len(set(len(layers) for layers in layers_per_size.values())) == 1
+
+        # Keep spec-decode draft layers together in a single group (skip the
+        # round-robin tuple-alignment split below, which would scatter the draft's
+        # SWA layers across groups and break the proposer's single-group assumption).
+        draft_in_spec = [
+            n
+            for names in layers_per_size.values()
+            for n in names
+            if n in draft_layer_names
+        ]
+        if draft_in_spec:
+            draft_specs = {n: sm_spec.kv_cache_specs[n] for n in draft_in_spec}
+            draft_uniform = UniformTypeKVCacheSpecs.from_specs(draft_specs)
+            assert draft_uniform is not None
+            swa_mla_groups.append(
+                KVCacheGroupSpec(
+                    layer_names=draft_in_spec, kv_cache_spec=draft_uniform
+                )
+            )
+            layers_per_size = {
+                ps: [n for n in names if n not in draft_layer_names]
+                for ps, names in layers_per_size.items()
+            }
+            if not any(layers_per_size.values()):
+                continue
+
         num_layers_per_size = len(next(iter(layers_per_size.values())))
 
         # Split layers inside each UniformKV group for aligned #(layers).
@@ -1730,7 +1780,10 @@ def get_kv_cache_groups(
         # yet some layers are full attention while others are sliding window
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
-        kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+        draft_layer_names = _get_draft_layer_names(vllm_config, kv_cache_spec)
+        kv_cache_groups = _get_kv_cache_groups_uniform_groups(
+            grouped_specs, draft_layer_names
+        )
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 

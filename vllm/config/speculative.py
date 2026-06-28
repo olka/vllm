@@ -54,8 +54,17 @@ MTPModelTypes = Literal[
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
+# DSpark = DFlash-style parallel block backbone + a low-rank Markov sequential head +
+# a confidence head (arXiv 2606.19348). It shares DFlash's aux-hidden-state plumbing, so
+# it is grouped with the Eagle/DFlash family that passes target hidden states to the draft.
+DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle",
+    "eagle3",
+    "extract_hidden_states",
+    MTPModelTypes,
+    DFlashModelTypes,
+    DSparkModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -321,11 +330,40 @@ class SpeculativeConfig:
                 {"n_predict": n_predict, "architectures": ["DeepSeekMTPModel"]}
             )
         if hf_config.model_type == "deepseek_v4":
-            hf_config.model_type = "deepseek_mtp"
-            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
-            hf_config.update(
-                {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
-            )
+            # A V4 checkpoint with `dspark_block_size` carries the DSpark drafter
+            # (parallel backbone + Markov + confidence heads) rather than the plain
+            # MTP layer; route it to the DSpark draft architecture and surface the
+            # dspark_config the proposer reads.
+            if getattr(hf_config, "dspark_block_size", None) is not None:
+                hf_config.model_type = "deepseek_mtp"
+                hf_config.update(
+                    {
+                        "architectures": ["DeepSeekV4DSparkModel"],
+                        # Capture target layers [40,41,42] as aux hidden states
+                        # (fused into main_x by the DSpark drafter).
+                        "eagle_aux_hidden_state_layer_ids": getattr(
+                            hf_config, "dspark_target_layer_ids", []
+                        ),
+                        "dspark_config": {
+                            "block_size": hf_config.dspark_block_size,
+                            "markov_rank": getattr(hf_config, "dspark_markov_rank", 256),
+                            "target_layer_ids": getattr(
+                                hf_config, "dspark_target_layer_ids", []
+                            ),
+                            "noise_token_id": getattr(
+                                hf_config, "dspark_noise_token_id", None
+                            ),
+                            "enable_confidence_head": True,
+                            "confidence_threshold": 0.5,
+                        },
+                    }
+                )
+            else:
+                hf_config.model_type = "deepseek_mtp"
+                n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+                hf_config.update(
+                    {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
+                )
         if hf_config.model_type in ("pangu_ultra_moe"):
             hf_config.model_type = "pangu_ultra_moe_mtp"
         if hf_config.model_type == "pangu_ultra_moe_mtp":
@@ -733,7 +771,9 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                    # dspark uses the DFlash-style parallel backbone; keep the
+                    # user-specified method even though model_type is deepseek_mtp.
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -791,7 +831,7 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.method == "dflash":
+                if self.method in ("dflash", "dspark"):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -1107,7 +1147,9 @@ class SpeculativeConfig:
         )
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp", "dflash")
+        # dspark is a DFlash-family parallel drafter (subclasses DFlashProposer), so it
+        # shares the eagle/dflash spec-decode plumbing (dispatch, KV spec, metadata).
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"

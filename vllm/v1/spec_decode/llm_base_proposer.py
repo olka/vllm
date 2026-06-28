@@ -334,10 +334,14 @@ class SpecDecodeBaseProposer:
         # for those masked slots.
 
         model_hf_config = self.draft_model_config.hf_config
-        # DFlash stores mask_token_id in dflash_config
+        # DFlash stores mask_token_id in dflash_config; DSpark stores the equivalent
+        # noise_token_id in dspark_config.
         dflash_config = getattr(model_hf_config, "dflash_config", None)
+        dspark_config = getattr(model_hf_config, "dspark_config", None)
         if dflash_config and "mask_token_id" in dflash_config:
             self.parallel_drafting_token_id = dflash_config["mask_token_id"]
+        elif dspark_config and dspark_config.get("noise_token_id") is not None:
+            self.parallel_drafting_token_id = dspark_config["noise_token_id"]
         elif hasattr(model_hf_config, "pard_token"):
             self.parallel_drafting_token_id = model_hf_config.pard_token
         elif hasattr(model_hf_config, "ptd_token_id"):
@@ -941,7 +945,7 @@ class SpecDecodeBaseProposer:
             return "DeepSeekMTPModel" in (
                 self.draft_model_config.hf_config.architectures or []
             )
-        return self.method not in ("mtp", "draft_model", "dflash")
+        return self.method not in ("mtp", "draft_model", "dflash", "dspark")
 
     def prepare_next_token_ids_cpu(
         self,

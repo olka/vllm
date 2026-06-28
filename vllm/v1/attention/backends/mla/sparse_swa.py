@@ -156,6 +156,9 @@ class DeepseekSparseSWAMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     block_size: int
+    # Causal masking. False for the DSpark draft block (semi-autoregressive: each
+    # block query attends to the full window incl. all block positions).
+    causal: bool = True
     seq_lens: torch.Tensor | None = None  # [num_seqs]
     query_start_loc: torch.Tensor | None = None  # [num_seqs + 1]
     query_start_loc_cpu: torch.Tensor | None = None  # [num_seqs + 1]
@@ -407,6 +410,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         is_valid_token.copy_(slot_mapping >= 0)
 
+        # Non-causal block attention for the DSpark draft (set on the drafting CAD).
+        is_causal = getattr(common_attn_metadata, "causal", True)
+
         if num_decode_tokens > 0:
             self.decode_swa_lens[num_decode_tokens:] = 0
             _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
@@ -423,6 +429,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 self.block_size,
                 token_offset=0,
                 TRITON_BLOCK_SIZE=1024,
+                IS_CAUSAL=is_causal,
             )
 
         # Prefill SWA indices live in paged coordinates. `token_offset` lets
@@ -445,6 +452,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 self.block_size,
                 token_offset=num_decode_tokens,
                 TRITON_BLOCK_SIZE=1024,
+                IS_CAUSAL=is_causal,
             )
 
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
@@ -464,6 +472,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         tile_sched = self.build_tile_scheduler(num_decode_tokens)
 
         return DeepseekSparseSWAMetadata(
+            causal=is_causal,
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,
@@ -623,6 +632,7 @@ def _compute_swa_indices_and_lens_kernel(
     block_size,
     token_offset,
     TRITON_BLOCK_SIZE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr = True,
 ):
     pid = tl.program_id(0)
     token_idx = pid + token_offset
@@ -641,8 +651,15 @@ def _compute_swa_indices_and_lens_kernel(
     prefix_len = seq_len - query_len
 
     pos = prefix_len + token_idx - query_start
-    start_pos = tl.maximum(pos - window_size + 1, 0)
-    end_pos = pos + 1
+    if IS_CAUSAL:
+        start_pos = tl.maximum(pos - window_size + 1, 0)
+        end_pos = pos + 1
+    else:
+        # Non-causal block (DSpark draft): every block query attends to the same
+        # last `window_size` positions, which include the full draft block and
+        # recent context. Caps swa_len at window_size (no buffer overflow).
+        end_pos = seq_len
+        start_pos = tl.maximum(seq_len - window_size, 0)
 
     swa_len = end_pos - start_pos
     tl.store(swa_lens_ptr + pid, swa_len)
