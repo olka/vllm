@@ -288,13 +288,6 @@ class DSparkProposer(DFlashProposer):
         # just selects which graph is replayed. (The ragged per-request keep below
         # is kept for reference/v2 but forces the eager list path.)
         length = schedule_uniform_length(surv, self._cost_a, self._cost_b)
-        # TEMP validation hook: DSPARK_FORCE_L pins L to test the L<gamma cudagraph
-        # path deterministically. Remove after the pack/bucket approach is validated.
-        import os
-
-        _force = os.environ.get("DSPARK_FORCE_L")
-        if _force:
-            length = max(1, min(int(_force), draft.shape[1]))
         self._last_budget = float(surv.shape[0] * (1 + length))
         # Uniform tensor draft -> stays on the runner's CUDA-graph tensor path.
         return draft[:, :length].contiguous()
